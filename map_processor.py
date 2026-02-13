@@ -9,6 +9,8 @@ from rasterio.windows import Window
 # Settings
 MAP_PATH = "dikilitas_new.tif"
 OUTPUT_DIR = "processed_map"
+TILE_SIZE = 3072  # covers drone FOV (~2500px at scale 0.35) with margin
+STRIDE = 1536     # 50% overlap for boundary handling
 
 def ensure_dir(d):
     if not os.path.exists(d):
@@ -40,17 +42,12 @@ def extract_features(gray):
     edges = cv2.Canny(blurred, 80, 200)
 
     # 2. Distance Transform
-    # Invert edges for DT (0=edge, 1=background)
-    # dist_transform expects 0 at the feature, non-zero elsewhere
-    # So we invert edges: 255 (edge) -> 0, 0 (bg) -> 255
     dt_input = cv2.bitwise_not(edges)
     dt = cv2.distanceTransform(dt_input, cv2.DIST_L2, 5)
 
     # 3. Lines (LSD)
     lsd = cv2.createLineSegmentDetector(0)
     lines, _, _, _ = lsd.detect(gray)
-
-    # Filter short lines? Maybe later.
 
     return edges, dt, lines
 
@@ -63,13 +60,6 @@ def main():
         height = src.height
 
         print(f"Map size: {width}x{height}")
-
-        # Single tile = entire map. No tiling needed for maps up to ~10k px.
-        # This eliminates tile disambiguation entirely: no overlap, no tile jumping.
-        TILE_SIZE = max(width, height)
-        STRIDE = TILE_SIZE
-
-        print(f"Using single-tile mode: {TILE_SIZE}x{TILE_SIZE}")
 
         # Get CRS and Transform
         transform_vals = [src.transform.a, src.transform.b, src.transform.c,
@@ -89,47 +79,55 @@ def main():
             "tiles": []
         }
 
-        # Read entire map as a single tile
-        img_data = src.read()
+        # Sliding window
+        for y in range(0, height, STRIDE):
+            for x in range(0, width, STRIDE):
+                window = Window(x, y, min(TILE_SIZE, width - x), min(TILE_SIZE, height - y))
 
-        # Handle shapes
-        if img_data.shape[0] == 1:
-            img = img_data[0]
-        else:
-            img = np.transpose(img_data[:3], (1, 2, 0))
-            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                if window.width < TILE_SIZE or window.height < TILE_SIZE:
+                    print(f"Skipping partial tile {x},{y}: {window.width}x{window.height}")
+                    continue
 
-        # Preprocess
-        gray = preprocess_tile(img)
-        if gray is None:
-            print("ERROR: Map image has insufficient data!")
-            return
+                img_data = src.read(window=window)
 
-        # Extract features
-        edges, dt, lines = extract_features(gray)
+                # Handle shapes
+                if img_data.shape[0] == 1:
+                    img = img_data[0]
+                else:
+                    img = np.transpose(img_data[:3], (1, 2, 0))
+                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-        # Save
-        tile_id = "tile_0_0"
-        tile_dir = os.path.join(OUTPUT_DIR, tile_id)
-        ensure_dir(tile_dir)
+                # Preprocess
+                gray = preprocess_tile(img)
+                if gray is None:
+                    continue
 
-        cv2.imwrite(os.path.join(tile_dir, "gray.png"), gray)
-        cv2.imwrite(os.path.join(tile_dir, "edges.png"), edges)
-        np.save(os.path.join(tile_dir, "dt.npy"), dt)
-        if lines is not None:
-            np.save(os.path.join(tile_dir, "lines.npy"), lines)
-        else:
-            np.save(os.path.join(tile_dir, "lines.npy"), np.array([]))
+                # Extract features
+                edges, dt, lines = extract_features(gray)
 
-        metadata["tiles"].append({
-            "id": tile_id,
-            "x": 0,
-            "y": 0,
-            "width": width,
-            "height": height
-        })
+                # Save
+                tile_id = f"tile_{x}_{y}"
+                tile_dir = os.path.join(OUTPUT_DIR, tile_id)
+                ensure_dir(tile_dir)
 
-        print(f"Processed {tile_id} ({width}x{height})")
+                cv2.imwrite(os.path.join(tile_dir, "gray.png"), gray)
+                cv2.imwrite(os.path.join(tile_dir, "edges.png"), edges)
+                np.save(os.path.join(tile_dir, "dt.npy"), dt)
+                if lines is not None:
+                    np.save(os.path.join(tile_dir, "lines.npy"), lines)
+                else:
+                    np.save(os.path.join(tile_dir, "lines.npy"), np.array([]))
+
+                # Store metadata
+                metadata["tiles"].append({
+                    "id": tile_id,
+                    "x": x,
+                    "y": y,
+                    "width": window.width,
+                    "height": window.height
+                })
+
+                print(f"Processed {tile_id}")
 
         # Save metadata
         with open(os.path.join(OUTPUT_DIR, "metadata.json"), "w") as f:

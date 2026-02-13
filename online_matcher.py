@@ -170,6 +170,7 @@ class DroneLocalizer:
         self.last_tile_idx = -1
         self.last_scale = None
         self.last_pose = None # {x, y, scale, angle} relative to tile
+        self.last_global_pos = None  # (gx, gy) in map pixel coords
         
         # Cache
         self.tile_cache = {}
@@ -1650,10 +1651,20 @@ class DroneLocalizer:
                         gt_ok = False
                         reject_reason.append("TEMP")
 
-                    # 6) Tile jump: absolutely forbidden
-                    if self.last_tile_idx not in (-1, best_match["tile_idx"]):
-                        gt_ok = False
-                        reject_reason.append("TILE_JUMP")
+                    # 6) Global position jump: check consistency in map coordinates
+                    # (tile ID can change between overlapping tiles — that's fine
+                    #  as long as the global position is consistent)
+                    if self.last_global_pos is not None:
+                        tile_info = self.tiles[best_match["tile_idx"]]
+                        cur_gx = tile_info["x"] + best_match["x"]
+                        cur_gy = tile_info["y"] + best_match["y"]
+                        dx = cur_gx - self.last_global_pos[0]
+                        dy = cur_gy - self.last_global_pos[1]
+                        pos_jump = (dx**2 + dy**2) ** 0.5
+                        # Max ~200px jump between consecutive GT frames
+                        if pos_jump > 200:
+                            gt_ok = False
+                            reject_reason.append("POS_JUMP")
 
                     # 7) Scale drift: max 10%
                     if self.last_scale is not None:
@@ -1771,6 +1782,12 @@ class DroneLocalizer:
                 self.lock_counter = LOCK_WINDOW
                 self.last_tile_idx = best_match["tile_idx"]
                 self.last_scale = best_match["scale"]
+                # Track global position for POS_JUMP check
+                _gt_tile = self.tiles[best_match["tile_idx"]]
+                self.last_global_pos = (
+                    _gt_tile["x"] + best_match["x"],
+                    _gt_tile["y"] + best_match["y"]
+                )
                 
                 _sf = verified_candidates[0]['score_final']
                 _gncc = verified_candidates[0]['gray_ncc']
