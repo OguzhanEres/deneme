@@ -374,9 +374,10 @@ class DroneLocalizer:
         return patch_edges, x1, y1
 
 
-    def coarse_search(self, frame_edges, top_k=5, prior_global_px=None, prior_roi_px=1100):
+    def coarse_search(self, frame_edges, top_k=5, prior_global_px=None, prior_roi_px=1100, frame_gray=None):
         """
         Match frame_edges against tiles.  GPU-accelerated via UMat.
+        Uses combined edge/DT + grayscale NCC scoring for farmland robustness.
         Returns Top-K matches list: [{tile_idx, score, ...}, ...]
         """
         # --- ROI GATING (best for clean GT): if prior is available, restrict GLOBAL/LOST search to tiles overlapping ROI ---
@@ -388,11 +389,9 @@ class DroneLocalizer:
                     roi_tile_idxs = None
             except Exception:
                 roi_tile_idxs = None
-        
-        
-        
+
         candidates = []
-        
+
         # Determine search indices
         if self.state == "LOCKED" and self.last_tile_idx != -1:
              current_tile = self.tiles[self.last_tile_idx]
@@ -407,18 +406,24 @@ class DroneLocalizer:
 
         if roi_tile_idxs is not None:
             search_indices = roi_tile_idxs
-            
+
+        use_gray = frame_gray is not None
+
         # Precompute rotated templates (keep on GPU)
         templates = []
         h, w = frame_edges.shape
         frame_gpu = _to_umat(frame_edges)
-        
+        if use_gray:
+            gray_gpu = _to_umat(frame_gray)
+
         for scale in COARSE_SCALES:
             scaled_w, scaled_h = int(w*scale), int(h*scale)
             if scaled_w == 0 or scaled_h == 0: continue
-            
+
             resized_gpu = cv2.resize(frame_gpu, (scaled_w, scaled_h))
-            
+            if use_gray:
+                gray_resized_gpu = cv2.resize(gray_gpu, (scaled_w, scaled_h))
+
             for angle in range(-ROTATION_RANGE, ROTATION_RANGE + 1, ROTATION_STEP):
                  M = cv2.getRotationMatrix2D((scaled_w//2, scaled_h//2), angle, 1.0)
                  rotated_gpu = cv2.warpAffine(resized_gpu, M, (scaled_w, scaled_h),
@@ -427,7 +432,8 @@ class DroneLocalizer:
                                               borderValue=0)
                  # Downsampled template on GPU (0.25x)
                  small_tmpl_gpu = cv2.resize(rotated_gpu, (0, 0), fx=0.25, fy=0.25)
-                 templates.append({
+
+                 tmpl_entry = {
                      "img_gpu": small_tmpl_gpu,
                      "scale": scale,
                      "angle": angle,
@@ -435,41 +441,62 @@ class DroneLocalizer:
                      "w": scaled_w,
                      "sh": _to_numpy(small_tmpl_gpu).shape[0],
                      "sw": _to_numpy(small_tmpl_gpu).shape[1],
-                 })
+                 }
+
+                 if use_gray:
+                     gray_rotated_gpu = cv2.warpAffine(gray_resized_gpu, M, (scaled_w, scaled_h),
+                                                       flags=cv2.INTER_LINEAR,
+                                                       borderMode=cv2.BORDER_CONSTANT,
+                                                       borderValue=0)
+                     tmpl_entry["gray_gpu"] = cv2.resize(gray_rotated_gpu, (0, 0), fx=0.25, fy=0.25)
+
+                 templates.append(tmpl_entry)
 
         # Match against tiles (GPU matchTemplate)
         all_candidates = []
-        
+
         for tile_idx in search_indices:
             tile_data = self.get_tile_data(tile_idx)
             inv_dt_gpu = tile_data["inv_dt_gpu"]
-            
+
             # Downsample tile on GPU
             small_inv_dt_gpu = cv2.resize(inv_dt_gpu, (0,0), fx=0.25, fy=0.25)
             si_h = _to_numpy(small_inv_dt_gpu).shape[0]
             si_w = _to_numpy(small_inv_dt_gpu).shape[1]
-            
+
+            # Downsample tile gray for NCC
+            if use_gray:
+                small_gray_tile_gpu = cv2.resize(_to_umat(tile_data["gray"]), (0,0), fx=0.25, fy=0.25)
+
             for t in templates:
                 if t["sh"] > si_h or t["sw"] > si_w:
                     continue
-                    
-                # GPU matchTemplate
+
+                # Edge/DT matchTemplate
                 res_gpu = cv2.matchTemplate(small_inv_dt_gpu, t["img_gpu"],
                                             cv2.TM_CCOEFF_NORMED)
-                _, max_val, _, max_loc = cv2.minMaxLoc(res_gpu)
-                
+                _, edge_score, _, max_loc = cv2.minMaxLoc(res_gpu)
+
+                # Grayscale NCC at the same location
+                combined_score = edge_score
+                if use_gray and "gray_gpu" in t:
+                    gray_res = cv2.matchTemplate(small_gray_tile_gpu, t["gray_gpu"],
+                                                 cv2.TM_CCOEFF_NORMED)
+                    _, gray_score, _, gray_loc = cv2.minMaxLoc(gray_res)
+                    combined_score = EDGE_SCORE_WEIGHT * edge_score + GRAY_NCC_WEIGHT * gray_score
+
                 # Track best score for debug
                 if not hasattr(self, '_best_score_seen'):
                     self._best_score_seen = 0.0
-                if max_val > self._best_score_seen:
-                    self._best_score_seen = max_val
+                if combined_score > self._best_score_seen:
+                    self._best_score_seen = combined_score
 
-                if max_val > 0.1:
+                if combined_score > 0.1:
                     x = max_loc[0] * 4
                     y = max_loc[1] * 4
                     all_candidates.append({
                         "tile_idx": tile_idx,
-                        "score": max_val,
+                        "score": combined_score,
                         "x": x,
                         "y": y,
                         "scale": t["scale"],
@@ -1302,7 +1329,9 @@ class DroneLocalizer:
             _nz = cv2.countNonZero(center_edges)
             print(f"[PATCH DEBUG] size={center_edges.shape} nz={_nz} off={off_x},{off_y}")
 
-            candidates_partial = self.coarse_search(center_edges, top_k=5, prior_global_px=self._prior_px, prior_roi_px=self.prior_roi_px)
+            # Extract center gray patch (same crop as edges)
+            center_gray = enhanced[off_y:off_y+center_edges.shape[0], off_x:off_x+center_edges.shape[1]].copy()
+            candidates_partial = self.coarse_search(center_edges, top_k=5, prior_global_px=self._prior_px, prior_roi_px=self.prior_roi_px, frame_gray=center_gray)
             
             # Convert partial-patch coords to full-frame coords
             candidates = []
@@ -1429,7 +1458,7 @@ class DroneLocalizer:
             if candidates:
                 _a = candidates[0]  # already expanded to full-frame w/h
                 anchor_med, _, _, _, _, _, _ = self.verify_match(_a, edges_for_coarse, frame_enhanced=None)
-                if anchor_med is not None and anchor_med > 10.0:
+                if anchor_med is not None and anchor_med > 25.0:
                     bad_anchor = True
                     print(f"[ANCHOR DEBUG] BAD ANCHOR! Score={_a['score']:.3f} Med={anchor_med:.1f}px")
             # Verify Top-K (pass enhanced for Sobel orientation)
@@ -1596,8 +1625,8 @@ class DroneLocalizer:
             reject_reason = []
             if best_match and best_metrics:
                 # --- relaxed gates for keeping a candidate in temporal buffer ---
-                pass_count    = (limit_count >= 500)
-                pass_accuracy = (median_dist <= 15.0)
+                pass_count    = (limit_count >= 15)
+                pass_accuracy = (median_dist <= 20.0)
                 pass_cov      = (grid_coverage >= 0.35)
                 pass_orient   = (oriented_core_ratio >= ORIENTED_CORE_RATIO_MIN)
 
