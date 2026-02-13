@@ -273,10 +273,28 @@ class DroneLocalizer:
             lines = np.load(lines_path)
         else:
             lines = None
-        
+
+        # Load uniqueness mask (edges unique to this tile, not shared with neighbors)
+        unique_path = os.path.join(path, "unique_edges.png")
+        if os.path.exists(unique_path):
+            unique_edges = cv2.imread(unique_path, 0)
+            # Build uniqueness-boosted inv_dt: blend standard inv_dt with unique-edge bonus
+            # Unique edges get extra weight → coarse search naturally prefers tiles
+            # where the match aligns with distinctive features
+            unique_dt_input = cv2.bitwise_not(unique_edges)
+            unique_dt = cv2.distanceTransform(unique_dt_input, cv2.DIST_L2, 5)
+            unique_inv = (np.exp(-unique_dt / 20.0) * 255).astype(np.uint8)
+            # Blend: 70% standard + 30% uniqueness-boosted
+            blended = cv2.addWeighted(inv_dt, 0.7, unique_inv, 0.3, 0).astype(np.uint8)
+        else:
+            blended = inv_dt
+
         data = {"inv_dt": inv_dt, "dt": dt, "info": tile_info, "gray": gray, "lines": lines,
                 # Pre-upload to GPU once – reused every frame
-                "inv_dt_gpu": _to_umat(inv_dt),
+                # Use uniqueness-blended inv_dt for coarse search
+                "inv_dt_gpu": _to_umat(blended),
+                # Keep original inv_dt for fine verification
+                "inv_dt_orig_gpu": _to_umat(inv_dt),
                 # Pre-compute Sobel theta on grayscale (used by orientation gate)
                 "theta_map": self._precompute_theta_map(gray),
                 }

@@ -9,8 +9,8 @@ from rasterio.windows import Window
 # Settings
 MAP_PATH = "dikilitas_new.tif"
 OUTPUT_DIR = "processed_map"
-TILE_SIZE = 4096  # reasonable tile size for 6400x6400 map
-STRIDE = 512      # dense overlap → more tiles → better disambiguation
+TILE_SIZE = 3072  # covers drone FOV (~2500px at scale 0.35) with margin
+STRIDE = 1536     # 50% overlap instead of 87.5% → tiles more distinguishable
 
 def ensure_dir(d):
     if not os.path.exists(d):
@@ -157,8 +157,73 @@ def main():
         # Save metadata
         with open(os.path.join(OUTPUT_DIR, "metadata.json"), "w") as f:
             json.dump(metadata, f, indent=2)
-            
-    print("Map processing complete..")
+
+    # ======================================================================
+    # PASS 2: Per-tile uniqueness mask
+    # For each tile, find edges that do NOT appear at the same global position
+    # in any other overlapping tile. These unique edges are the best features
+    # for disambiguation (farmland edges repeat across tiles).
+    # ======================================================================
+    print("\n--- Computing per-tile uniqueness masks ---")
+    tiles_meta = metadata["tiles"]
+    n_tiles = len(tiles_meta)
+
+    # Load all edges into memory indexed by global origin
+    all_edges = {}
+    for tm in tiles_meta:
+        epath = os.path.join(OUTPUT_DIR, tm["id"], "edges.png")
+        all_edges[tm["id"]] = cv2.imread(epath, 0)
+
+    for i, ti in enumerate(tiles_meta):
+        edges_i = all_edges[ti["id"]]
+        # Start with all edge pixels marked as unique
+        unique_mask = edges_i.copy()  # 255 where edge, 0 elsewhere
+
+        for j, tj in enumerate(tiles_meta):
+            if i == j:
+                continue
+            # Compute overlap region in global coords
+            ox0 = max(ti["x"], tj["x"])
+            oy0 = max(ti["y"], tj["y"])
+            ox1 = min(ti["x"] + TILE_SIZE, tj["x"] + TILE_SIZE)
+            oy1 = min(ti["y"] + TILE_SIZE, tj["y"] + TILE_SIZE)
+            if ox1 <= ox0 or oy1 <= oy0:
+                continue  # no overlap
+
+            # Local coords in tile i
+            li_x0 = ox0 - ti["x"]
+            li_y0 = oy0 - ti["y"]
+            li_x1 = ox1 - ti["x"]
+            li_y1 = oy1 - ti["y"]
+
+            # Local coords in tile j
+            lj_x0 = ox0 - tj["x"]
+            lj_y0 = oy0 - tj["y"]
+            lj_x1 = ox1 - tj["x"]
+            lj_y1 = oy1 - tj["y"]
+
+            # Edges that exist in BOTH tiles at the same global position → not unique
+            overlap_i = edges_i[li_y0:li_y1, li_x0:li_x1]
+            overlap_j = all_edges[tj["id"]][lj_y0:lj_y1, lj_x0:lj_x1]
+
+            # Dilate slightly to account for 1-2px alignment differences
+            kernel = np.ones((3, 3), np.uint8)
+            shared = cv2.bitwise_and(overlap_i, cv2.dilate(overlap_j, kernel, iterations=1))
+
+            # Remove shared edges from unique mask
+            unique_mask[li_y0:li_y1, li_x0:li_x1] = cv2.bitwise_and(
+                unique_mask[li_y0:li_y1, li_x0:li_x1],
+                cv2.bitwise_not(shared))
+
+        # Save uniqueness mask
+        upath = os.path.join(OUTPUT_DIR, ti["id"], "unique_edges.png")
+        cv2.imwrite(upath, unique_mask)
+        n_total = np.count_nonzero(edges_i)
+        n_unique = np.count_nonzero(unique_mask)
+        pct = 100 * n_unique / max(n_total, 1)
+        print(f"  {ti['id']}: {n_unique}/{n_total} unique edges ({pct:.1f}%)")
+
+    print("Map processing complete.")
 
 if __name__ == "__main__":
     main()
