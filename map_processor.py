@@ -37,15 +37,25 @@ def extract_features(gray):
     """
     Extract Canny edges, Distance Transform, and Lines.
     """
-    # 1. Canny Edges (blur + high thresholds + erosion to reduce density)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    # 1. Sharpen (unsharp mask) — same as online_matcher.preprocess_frame
+    gaussian = cv2.GaussianBlur(gray, (0, 0), 3.0)
+    sharpened = cv2.addWeighted(gray, 1.5, gaussian, -0.5, 0)
+
+    # 2. Canny Edges
+    blurred = cv2.GaussianBlur(sharpened, (5, 5), 0)
     edges = cv2.Canny(blurred, 80, 200)
 
-    # 2. Distance Transform
+    # 3. Remove small blobs (area < 30 px) — same as online_matcher
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(edges, connectivity=8)
+    for lbl in range(1, n_labels):
+        if stats[lbl, cv2.CC_STAT_AREA] < 30:
+            edges[labels == lbl] = 0
+
+    # 4. Distance Transform
     dt_input = cv2.bitwise_not(edges)
     dt = cv2.distanceTransform(dt_input, cv2.DIST_L2, 5)
 
-    # 3. Lines (LSD)
+    # 5. Lines (LSD)
     lsd = cv2.createLineSegmentDetector(0)
     lines, _, _, _ = lsd.detect(gray)
 
