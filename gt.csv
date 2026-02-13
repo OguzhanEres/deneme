@@ -1,0 +1,1 @@
+frame_idx,timestamp,lat,lon,rotation,scale,score,score_final,gray_ncc,median_dist,inlier_count,coverage,tile_id,core_count,core_ratio,oriented_core_ratio,uniqueness,line_med,line_cr
