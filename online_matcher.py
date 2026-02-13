@@ -138,7 +138,7 @@ EDGE_ACCUM_N        = 5          # number of recent frames to OR together
 
 # --- NEW: Temporal N-frame lock ---
 TEMPORAL_LOCK_N = 3  # tracking lock
-GT_LOCK_N = 8        # GT write lock             # consecutive consistent frames before GT write
+GT_LOCK_N = 2        # GT write lock             # consecutive consistent frames before GT write
 TEMPORAL_MAX_JUMP_M = 30.0       # max jump in metres between consecutive frames
 TEMPORAL_MAX_ANGLE_DIFF = 10.0   # max rotation change between consecutive frames
 
@@ -1675,8 +1675,8 @@ class DroneLocalizer:
                         gt_ok = False
                         reject_reason.append("MP_STD")
 
-                    # 5) Temporal lock: at least 4 consecutive frames in streak
-                    if len(pending_streak) < 4:
+                    # 5) Temporal lock: at least 2 consecutive frames in streak
+                    if len(pending_streak) < GT_LOCK_N:
                         gt_ok = False
                         reject_reason.append("TEMP")
 
