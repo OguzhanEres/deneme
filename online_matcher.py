@@ -1666,12 +1666,12 @@ class DroneLocalizer:
                         reject_reason.append("MED")
 
                     # 3) Core ratio must be strong
-                    if core_ratio < 0.40:
+                    if core_ratio < 0.20:
                         gt_ok = False
                         reject_reason.append("CORE")
 
                     # 4) Multipatch spatial std must be tight
-                    if multipatch_pos_std > 120:
+                    if multipatch_pos_std > MULTI_PATCH_POS_THR:
                         gt_ok = False
                         reject_reason.append("MP_STD")
 
@@ -1703,12 +1703,12 @@ class DroneLocalizer:
                             reject_reason.append("SCALE_DRIFT")
 
                     # 8) Oriented core ratio
-                    if oriented_core_ratio < 0.15:
+                    if oriented_core_ratio < 0.10:
                         gt_ok = False
                         reject_reason.append("ORI")
 
                     # 9) Grid coverage
-                    if grid_coverage < 0.45:
+                    if grid_coverage < 0.35:
                         gt_ok = False
                         reject_reason.append("COV")
 
