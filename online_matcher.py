@@ -104,10 +104,10 @@ SKIP_SECONDS = 35 # Skip takeoff sequence
 
 # --- Uniqueness gate thresholds (ratio-based + absolute) ---
 # --- Uniqueness gate thresholds (ratio-based + absolute) ---
-UNIQUENESS_MEDIAN_RATIO = 1.15   # median2/median1 must be >= this
-UNIQUENESS_MEDIAN_DIFF  = 0.3    # OR median2 - median1 must be >= this
-UNIQUENESS_CORE_DIFF    = 0.03   # core_ratio1 - core_ratio2 must be >= this
-UNIQUENESS_SCORE_RATIO  = 1.05   # score1/score2 must be >= this
+UNIQUENESS_MEDIAN_RATIO = 1.10   # median2/median1 must be >= this (lowered for more matches)
+UNIQUENESS_MEDIAN_DIFF  = 0.2    # OR median2 - median1 must be >= this (lowered)
+UNIQUENESS_CORE_DIFF    = 0.02   # core_ratio1 - core_ratio2 must be >= this (lowered)
+UNIQUENESS_SCORE_RATIO  = 1.03   # score1/score2 must be >= this (lowered)
 
 # --- Orientation gate (tightened for GT mode) ---
 ORIENTED_CORE_RATIO_MIN  = 0.10  # min fraction of edges with matching gradient direction
