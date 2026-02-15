@@ -105,9 +105,9 @@ class Config:
 
     # SIFT matching
     sift_max_keypoints: int = 4000    # for frame
-    lowe_ratio: float = 0.80         # Lowe's ratio test (relaxed for cross-domain)
-    min_inliers: int = 10            # min RANSAC inliers for valid match
-    ransac_reproj_thresh: float = 8.0 # RANSAC reprojection threshold (px)
+    lowe_ratio: float = 0.90         # Lowe's ratio test (very relaxed for cross-domain)
+    min_inliers: int = 8             # min RANSAC inliers for valid match
+    ransac_reproj_thresh: float = 10.0 # RANSAC reprojection threshold (px)
 
     # Verification thresholds
     min_ncc: float = 0.15            # grayscale NCC minimum (relaxed for cross-domain)
