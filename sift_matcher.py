@@ -27,6 +27,9 @@ import re as _re
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List, Dict
 
+import torch
+from lightglue import LightGlue
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DJI SRT Parser (reused from original)
@@ -193,17 +196,15 @@ class SIFTMatcher:
         self.stride = 0
 
         # SIFT detector for frames
-        # CRITICAL: must use same params as tile processor (sift_map_processor.py line 70)
-        # otherwise descriptors won't match!
         self.sift = cv2.SIFT_create(nfeatures=cfg.sift_max_keypoints)
 
-        # BFMatcher as primary (more reliable than FLANN for cross-domain)
-        self.bf_matcher = cv2.BFMatcher(cv2.NORM_L2)
+        # LightGlue matcher (learned SIFT matching)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.lightglue = LightGlue(features="sift").eval().to(self.device)
+        print(f"[LIGHTGLUE] Initialized on {self.device}")
 
-        # FLANN matcher as backup
-        index_params = dict(algorithm=1, trees=5)  # FLANN_INDEX_KDTREE
-        search_params = dict(checks=50)
-        self.flann = cv2.FlannBasedMatcher(index_params, search_params)
+        # BFMatcher kept for global descriptor retrieval only
+        self.bf_matcher = cv2.BFMatcher(cv2.NORM_L2)
 
         # Caches
         self.tile_cache = {}          # tile_idx -> tile data dict
@@ -330,10 +331,11 @@ class SIFTMatcher:
         sift_path = os.path.join(tile_dir, "sift_kp.npz")
         if os.path.exists(sift_path):
             data = np.load(sift_path)
-            kp_array = data["keypoints"]
+            kp_array = data["keypoints"]  # Nx7: x,y,size,angle,response,octave,class_id
             descs = data["descriptors"]
             kps = array_to_keypoints(kp_array)
         else:
+            kp_array = np.zeros((0, 7), dtype=np.float32)
             kps, descs = [], np.zeros((0, 128), dtype=np.float32)
 
         result = {
@@ -341,6 +343,7 @@ class SIFTMatcher:
             "gray": gray,
             "keypoints": kps,
             "descriptors": descs,
+            "kp_array": kp_array,
         }
         self.tile_cache[tile_idx] = result
         return result
@@ -444,90 +447,131 @@ class SIFTMatcher:
         descs = descs / np.maximum(l1_norms, 1e-7)
         return np.sqrt(descs)
 
-    def match_tile(self, frame_kps, frame_descs, tile_idx, verbose=False):
+    def _prepare_lightglue_features(self, kps, descs, image_h, image_w):
+        """Convert OpenCV SIFT keypoints+descriptors to LightGlue tensor format."""
+        n = len(kps)
+        if n == 0:
+            return {
+                "keypoints": torch.zeros(1, 0, 2, device=self.device),
+                "descriptors": torch.zeros(1, 0, 128, device=self.device),
+                "scales": torch.zeros(1, 0, device=self.device),
+                "oris": torch.zeros(1, 0, device=self.device),
+                "image_size": torch.tensor([[image_h, image_w]], device=self.device),
+            }
+
+        pts = np.array([kp.pt for kp in kps], dtype=np.float32)     # (N, 2)
+        scales = np.array([kp.size for kp in kps], dtype=np.float32) # (N,)
+        oris = np.array([kp.angle for kp in kps], dtype=np.float32)  # (N,) degrees
+
+        # Normalize descriptors to unit length (LightGlue expects this)
+        d = descs.astype(np.float32)
+        norms = np.linalg.norm(d, axis=1, keepdims=True)
+        d = d / np.maximum(norms, 1e-7)
+
+        return {
+            "keypoints": torch.from_numpy(pts).unsqueeze(0).to(self.device),          # (1, N, 2)
+            "descriptors": torch.from_numpy(d).unsqueeze(0).to(self.device),           # (1, N, 128)
+            "scales": torch.from_numpy(scales).unsqueeze(0).to(self.device),           # (1, N)
+            "oris": torch.from_numpy(np.deg2rad(oris)).unsqueeze(0).to(self.device),   # (1, N) radians
+            "image_size": torch.tensor([[image_h, image_w]], device=self.device),
+        }
+
+    def _prepare_lightglue_from_array(self, kp_array, descs, image_h, image_w):
+        """Convert Nx7 keypoint array + descriptors to LightGlue tensor format."""
+        n = len(kp_array)
+        if n == 0:
+            return {
+                "keypoints": torch.zeros(1, 0, 2, device=self.device),
+                "descriptors": torch.zeros(1, 0, 128, device=self.device),
+                "scales": torch.zeros(1, 0, device=self.device),
+                "oris": torch.zeros(1, 0, device=self.device),
+                "image_size": torch.tensor([[image_h, image_w]], device=self.device),
+            }
+
+        pts = kp_array[:, :2].astype(np.float32)        # x, y
+        scales = kp_array[:, 2].astype(np.float32)       # size
+        oris = kp_array[:, 3].astype(np.float32)         # angle (degrees)
+
+        d = descs.astype(np.float32)
+        norms = np.linalg.norm(d, axis=1, keepdims=True)
+        d = d / np.maximum(norms, 1e-7)
+
+        return {
+            "keypoints": torch.from_numpy(pts).unsqueeze(0).to(self.device),
+            "descriptors": torch.from_numpy(d).unsqueeze(0).to(self.device),
+            "scales": torch.from_numpy(scales).unsqueeze(0).to(self.device),
+            "oris": torch.from_numpy(np.deg2rad(oris)).unsqueeze(0).to(self.device),
+            "image_size": torch.tensor([[image_h, image_w]], device=self.device),
+        }
+
+    def match_tile(self, frame_kps, frame_descs, tile_idx, verbose=False,
+                   frame_h=None, frame_w=None):
         """
-        Match frame SIFT features against a single tile.
+        Match frame SIFT features against a single tile using LightGlue.
         Returns: dict with H, inlier_mask, matches etc, or None
         """
         tile_data = self.get_tile_data(tile_idx)
         tile_descs = tile_data["descriptors"]
         tile_kps = tile_data["keypoints"]
+        tile_kp_array = tile_data["kp_array"]
         tile_id = self.tiles[tile_idx]["id"]
+        tile_gray = tile_data["gray"]
+        tile_h, tile_w = tile_gray.shape[:2]
 
         if len(tile_descs) < 10 or len(frame_descs) < 10:
             if verbose:
                 print(f"    [{tile_id}] Too few descriptors: tile={len(tile_descs)} frame={len(frame_descs)}")
             return None
 
-        # RootSIFT: L1-normalize + sqrt for better cross-domain matching
-        frame_rsift = self.rootsift_transform(frame_descs)
-        tile_rsift = self.rootsift_transform(tile_descs)
+        # Prepare LightGlue input tensors
+        fh = frame_h if frame_h else 720
+        fw = frame_w if frame_w else 1280
+        feats0 = self._prepare_lightglue_features(frame_kps, frame_descs, fh, fw)
+        feats1 = self._prepare_lightglue_from_array(tile_kp_array, tile_descs, tile_h, tile_w)
 
-        # Forward knnMatch (frame → tile)
-        try:
-            fwd_matches = self.bf_matcher.knnMatch(frame_rsift, tile_rsift, k=2)
-        except cv2.error as e:
-            if verbose:
-                print(f"    [{tile_id}] BFMatcher error: {e}")
+        # Run LightGlue matching
+        with torch.no_grad():
+            result = self.lightglue({"image0": feats0, "image1": feats1})
+
+        matches0 = result["matches0"][0].cpu().numpy()  # (N_frame,) -1 = unmatched
+        scores0 = result["matching_scores0"][0].cpu().numpy()
+
+        # Extract valid matches
+        valid = matches0 > -1
+        n_matched = int(valid.sum())
+
+        if verbose:
+            print(f"    [{tile_id}] lightglue={n_matched}/{len(frame_kps)} tile_kps={len(tile_kps)}")
+
+        if n_matched < self.cfg.min_inliers:
             return None
 
-        # Backward match (tile → frame) for mutual nearest neighbor check
-        try:
-            bwd_matches = self.bf_matcher.match(tile_rsift, frame_rsift)
-        except cv2.error:
-            bwd_matches = []
+        # Build point correspondences
+        frame_idx_matched = np.where(valid)[0]
+        tile_idx_matched = matches0[valid]
 
-        # Build reverse lookup: tile_desc_idx -> best frame_desc_idx
-        bwd_map = {}
-        for m in bwd_matches:
-            bwd_map[m.queryIdx] = m.trainIdx
+        src_pts = np.float32([frame_kps[i].pt for i in frame_idx_matched]).reshape(-1, 1, 2)
+        dst_pts = np.float32([tile_kps[j].pt for j in tile_idx_matched]).reshape(-1, 1, 2)
 
-        # Lowe's ratio test + Mutual Nearest Neighbor filter
-        good_matches = []
-        n_ratio_only = 0
-        n_single = 0
-        for pair in fwd_matches:
-            if len(pair) == 2:
-                m, n = pair
-                if m.distance < self.cfg.lowe_ratio * n.distance:
-                    n_ratio_only += 1
-                    # MNN check: tile's best match for m.trainIdx must be m.queryIdx
-                    if bwd_map.get(m.trainIdx) == m.queryIdx:
-                        good_matches.append(m)
-            elif len(pair) == 1:
-                n_single += 1
-
-        if verbose or len(good_matches) < self.cfg.min_inliers:
-            print(f"    [{tile_id}] raw={len(fwd_matches)} ratio={n_ratio_only} "
-                  f"mnn={len(good_matches)} single={n_single} tile_kps={len(tile_kps)}")
-
-        if len(good_matches) < self.cfg.min_inliers:
-            return None
-
-        # Extract matched point coordinates
-        src_pts = np.float32([frame_kps[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-        dst_pts = np.float32([tile_kps[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-
-        # RANSAC homography (USAC_MAGSAC for better outlier handling)
+        # RANSAC homography
         try:
             H, mask = cv2.findHomography(
                 src_pts, dst_pts, cv2.USAC_MAGSAC, self.cfg.ransac_reproj_thresh,
                 maxIters=10000, confidence=0.9999)
         except cv2.error:
-            # Fallback to standard RANSAC if USAC not available
             H, mask = cv2.findHomography(
                 src_pts, dst_pts, cv2.RANSAC, self.cfg.ransac_reproj_thresh)
 
         if H is None:
             if verbose:
-                print(f"    [{tile_id}] RANSAC failed (H is None) from {len(good_matches)} matches")
+                print(f"    [{tile_id}] RANSAC failed from {n_matched} LightGlue matches")
             return None
 
         inlier_mask = mask.ravel().astype(bool)
         n_inliers = int(inlier_mask.sum())
 
         if verbose:
-            print(f"    [{tile_id}] inliers={n_inliers}/{len(good_matches)}")
+            print(f"    [{tile_id}] inliers={n_inliers}/{n_matched}")
 
         if n_inliers < self.cfg.min_inliers:
             return None
@@ -535,9 +579,9 @@ class SIFTMatcher:
         return {
             "H": H,
             "inlier_mask": inlier_mask,
-            "matches": good_matches,
+            "matches": None,  # LightGlue doesn't produce cv2.DMatch objects
             "n_inliers": n_inliers,
-            "n_total_matches": len(good_matches),
+            "n_total_matches": n_matched,
             "src_pts": src_pts,
             "dst_pts": dst_pts,
             "tile_idx": tile_idx,
@@ -894,30 +938,39 @@ class SIFTMatcher:
             tile_kps = tile_data["keypoints"]
             tile_id = self.tiles[tile_idx]["id"]
             H = match_result["H"]
-            good_matches = match_result["matches"]
             inlier_mask = match_result["inlier_mask"]
 
             frame_bgr = cv2.cvtColor(frame_gray, cv2.COLOR_GRAY2BGR)
             tile_bgr = cv2.cvtColor(tile_gray, cv2.COLOR_GRAY2BGR)
 
-            # Separate inliers/outliers
-            inlier_matches = [m for i, m in enumerate(good_matches) if inlier_mask[i]]
-            outlier_matches = [m for i, m in enumerate(good_matches) if not inlier_mask[i]]
+            # Build match visualization using src/dst points
+            src_pts_vis = match_result["src_pts"].reshape(-1, 2)
+            dst_pts_vis = match_result["dst_pts"].reshape(-1, 2)
+
+            # Create temporary keypoint lists for drawMatches
+            vis_kps_frame = [cv2.KeyPoint(x=float(p[0]), y=float(p[1]), size=5)
+                             for p in src_pts_vis]
+            vis_kps_tile = [cv2.KeyPoint(x=float(p[0]), y=float(p[1]), size=5)
+                            for p in dst_pts_vis]
+            all_dmatches = [cv2.DMatch(i, i, 0) for i in range(len(src_pts_vis))]
+
+            inlier_dm = [m for i, m in enumerate(all_dmatches) if inlier_mask[i]]
+            outlier_dm = [m for i, m in enumerate(all_dmatches) if not inlier_mask[i]]
 
             # Draw outliers (red, thin)
             match_img = cv2.drawMatches(
-                frame_bgr, frame_kps,
-                tile_bgr, tile_kps,
-                outlier_matches, None,
+                frame_bgr, vis_kps_frame,
+                tile_bgr, vis_kps_tile,
+                outlier_dm, None,
                 matchColor=(0, 0, 150),
                 singlePointColor=(80, 80, 80),
                 flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
 
             # Draw inliers on top (green)
             match_img = cv2.drawMatches(
-                frame_bgr, frame_kps,
-                tile_bgr, tile_kps,
-                inlier_matches, match_img,
+                frame_bgr, vis_kps_frame,
+                tile_bgr, vis_kps_tile,
+                inlier_dm, match_img,
                 matchColor=(0, 255, 0),
                 singlePointColor=(0, 200, 0),
                 flags=(cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS |
@@ -1049,9 +1102,11 @@ class SIFTMatcher:
         self._match_call_count += 1
         verbose = self._match_call_count <= 3
 
+        fh, fw = frame_gray.shape[:2]
         all_results = []
         for tile_idx in candidate_tiles:
-            result = self.match_tile(frame_kps, frame_descs, tile_idx, verbose=verbose)
+            result = self.match_tile(frame_kps, frame_descs, tile_idx, verbose=verbose,
+                                     frame_h=fh, frame_w=fw)
             if result is not None:
                 result["_frame_kps"] = frame_kps
                 all_results.append(result)
