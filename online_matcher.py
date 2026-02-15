@@ -122,6 +122,11 @@ GRAY_NCC_MIN_GATE = 0.25         # minimum NCC for GT acceptance (texture must a
 EDGE_DENSITY_MIN  = 0.004        # minimum edge pixel ratio (edge_pixels / total_pixels)
                                   # frames with fewer edges are too featureless for reliable matching
 
+# --- Contour chain consistency (shoreline matching) ---
+CONTOUR_MIN_ARC       = 60       # minimum contour arc length (px) to be considered
+CONTOUR_CHAIN_MIN     = 0.55     # minimum chain consistency score for GT acceptance
+CONTOUR_LABEL_THICK   = 7        # label map dilation thickness (tolerance for projection error)
+
 # --- Line-only verify ---
 LINE_MIN_LENGTH = 200            # min line segment length (px) – raised for road/canal only
 LINE_TOP_N      = 20             # keep only this many longest lines
@@ -677,6 +682,109 @@ class DroneLocalizer:
                 return False
 
         return True
+
+    # ------------------------------------------------------------------
+    #  Contour chain matching ("shoreline" shape matching)
+    # ------------------------------------------------------------------
+    def _extract_major_contours(self, edges, min_arc_length=None):
+        """
+        Extract major contours from edge image as polylines.
+        Edges are connected into chains (like shoreline strips), small blobs discarded.
+        """
+        if min_arc_length is None:
+            min_arc_length = CONTOUR_MIN_ARC
+        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        major = []
+        for cnt in contours:
+            arc = cv2.arcLength(cnt, False)
+            if arc >= min_arc_length:
+                epsilon = 0.005 * arc
+                approx = cv2.approxPolyDP(cnt, epsilon, False)
+                major.append(approx)
+        major.sort(key=lambda c: cv2.arcLength(c, False), reverse=True)
+        return major
+
+    def _contour_chain_verify(self, tile_data, frame_edges, match, fh, fw):
+        """
+        Contour chain consistency: do frame contour shapes map onto
+        consistent tile contour shapes?
+
+        Logic:
+        1. Extract frame contours (polylines = "shorelines")
+        2. Extract tile contours from DT (dt < 1.0 = edge pixels)
+        3. Build tile contour label map (each contour = unique label)
+        4. Project frame contour points to tile space
+        5. For each frame contour, check if projected points hit the
+           SAME tile contour (chain consistency)
+
+        A high score means frame shapes are preserved in the tile.
+        A low score means frame edges scatter across unrelated tile edges.
+
+        Returns: (chain_score, n_frame_contours)
+        """
+        from collections import Counter
+
+        # 1. Frame contours
+        frame_contours = self._extract_major_contours(frame_edges)
+        if len(frame_contours) < 2:
+            return 0.0, len(frame_contours)
+
+        # 2. Tile edges from DT
+        dt = tile_data["dt"]
+        tile_edges = (dt < 1.0).astype(np.uint8) * 255
+        tile_contours = self._extract_major_contours(tile_edges)
+        if len(tile_contours) < 2:
+            return 0.0, len(frame_contours)
+
+        # 3. Build tile contour label map
+        label_map = np.zeros(dt.shape, dtype=np.int32)
+        for i, tc in enumerate(tile_contours):
+            cv2.drawContours(label_map, [tc], -1, i + 1,
+                             thickness=CONTOUR_LABEL_THICK)
+
+        # 4. Transform frame contours to tile space
+        scale = float(match["scale"])
+        angle = float(match["angle"])
+        x, y = int(match["x"]), int(match["y"])
+        center = (fw * scale / 2.0, fh * scale / 2.0)
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+
+        total_weighted = 0.0
+        total_weight = 0.0
+
+        for fc in frame_contours:
+            pts = fc.astype(np.float64).reshape(-1, 2)
+            pts = pts * scale
+            pts_t = cv2.transform(pts.reshape(-1, 1, 2), M).reshape(-1, 2)
+            pts_t[:, 0] += x
+            pts_t[:, 1] += y
+
+            # Vectorized label lookup
+            pts_int = np.round(pts_t).astype(np.int32)
+            valid = ((pts_int[:, 0] >= 0) & (pts_int[:, 0] < label_map.shape[1]) &
+                     (pts_int[:, 1] >= 0) & (pts_int[:, 1] < label_map.shape[0]))
+            valid_pts = pts_int[valid]
+            if len(valid_pts) < 3:
+                continue
+
+            labels = label_map[valid_pts[:, 1], valid_pts[:, 0]]
+            labels = labels[labels > 0]
+            if len(labels) < 3:
+                continue
+
+            # Chain consistency: fraction hitting the dominant tile contour
+            counter = Counter(labels.tolist())
+            dominant_count = counter.most_common(1)[0][1]
+            consistency = dominant_count / len(labels)
+
+            weight = cv2.arcLength(fc, False)
+            total_weighted += consistency * weight
+            total_weight += weight
+
+        if total_weight < 1.0:
+            return 0.0, len(frame_contours)
+
+        return total_weighted / total_weight, len(frame_contours)
 
     # ------------------------------------------------------------------
     #  Orientation (gradient direction) verification
@@ -1517,10 +1625,14 @@ class DroneLocalizer:
                 line_med, line_cr = self._compute_line_verify(
                     tile_data_c, long_line_mask, cand, fh, fw)
 
+                # --- Contour chain consistency ("shoreline" matching) ---
+                chain_score, chain_n = self._contour_chain_verify(
+                    tile_data_c, edges, cand, fh, fw)
+
                 # --- Combined score (edge coarse + gray NCC) ---
                 score_final = (EDGE_SCORE_WEIGHT * cand["score"]
                                + GRAY_NCC_WEIGHT * max(0.0, gray_ncc))
-                
+
                 verified_candidates.append({
                     "cand": cand,
                     "quality": score_final,
@@ -1529,6 +1641,8 @@ class DroneLocalizer:
                     "line_med": line_med,
                     "line_cr": line_cr,
                     "score_final": score_final,
+                    "chain_score": chain_score,
+                    "chain_n": chain_n,
                 })
 
             # Sort by DT alignment quality: core_ratio (desc) is the most
@@ -1739,7 +1853,15 @@ class DroneLocalizer:
                         gt_ok = False
                         reject_reason.append("NCC_LOW")
 
-                    # 12) Temporal consistency check (spatial jump between frames)
+                    # 12) Contour chain consistency: frame contour shapes must
+                    #     map onto consistent tile contour shapes
+                    _best_chain = verified_candidates[0].get("chain_score", 0.0) if verified_candidates else 0.0
+                    _best_chain_n = verified_candidates[0].get("chain_n", 0) if verified_candidates else 0
+                    if _best_chain_n >= 2 and _best_chain < CONTOUR_CHAIN_MIN:
+                        gt_ok = False
+                        reject_reason.append("CHAIN")
+
+                    # 13) Temporal consistency check (spatial jump between frames)
                     if gt_ok:
                         if not self.check_temporal_consistency(match_data, pending_streak[:-1], required_n=GT_LOCK_N):
                             gt_ok = False
@@ -1937,6 +2059,11 @@ class DroneLocalizer:
             diag_parts.append(f"edg={edge_before}/{edge_after}")
             diag_parts.append(f"strk={len(pending_streak)}")
             diag_parts.append(f"mpstd={multipatch_pos_std:.1f}")
+            # Chain contour score
+            if verified_candidates:
+                _cs = verified_candidates[0].get("chain_score", 0.0)
+                _cn = verified_candidates[0].get("chain_n", 0)
+                diag_parts.append(f"chain={_cs:.2f}({_cn})")
             if is_valid_gt:
                 diag_parts.append("GT_SAVED_ULTRA")
             elif reject_reason:
@@ -2044,12 +2171,18 @@ class DroneLocalizer:
         canvas_w = w_f * 3
         canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
 
-        # --- Top-left: Frame edges (GREEN) ---
+        # --- Top-left: Frame edges with contour overlay ---
         frame_vis = cv2.cvtColor(frame_edges, cv2.COLOR_GRAY2BGR)
         frame_vis[frame_edges > 0] = [0, 255, 0]  # green edges
+        # Draw major contours as colored polylines (shoreline chains)
+        frame_contours = self._extract_major_contours(frame_edges)
+        contour_colors = [(0, 255, 255), (255, 0, 255), (255, 165, 0),
+                          (0, 165, 255), (255, 255, 0), (128, 255, 128)]
+        for ci, cnt in enumerate(frame_contours[:6]):
+            cv2.drawContours(frame_vis, [cnt], -1, contour_colors[ci % len(contour_colors)], 2)
         canvas[0:h_f, 0:w_f] = frame_vis
-        cv2.putText(canvas, "FRAME EDGES", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                   0.8, (0, 255, 0), 2)
+        cv2.putText(canvas, f"FRAME CONTOURS ({len(frame_contours)})", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         # --- Top-middle: Best candidate tile edges (CYAN) ---
         tile1_data = self.get_tile_data(best["cand"]["tile_idx"])
@@ -2067,16 +2200,24 @@ class DroneLocalizer:
         tile1_vis[tile1_edges_resized > 0] = [255, 255, 0]  # cyan edges
         canvas[0:h_f, w_f:w_f*2] = tile1_vis
 
+        # Draw tile contours too
+        tile1_contours = self._extract_major_contours(tile1_edges_resized)
+        for ci, cnt in enumerate(tile1_contours[:6]):
+            cv2.drawContours(canvas[0:h_f, w_f:w_f*2], [cnt], -1,
+                             contour_colors[ci % len(contour_colors)], 2)
+
         # Metrics text for best
         m1 = best["metrics"]
         score1 = best["score_final"]
+        _cs1 = best.get("chain_score", 0.0)
+        _cn1 = best.get("chain_n", 0)
         text1 = [
             f"BEST (Tile {best['cand']['tile_idx']})",
-            f"Score: {score1:.3f}",
+            f"Score: {score1:.3f}  NCC: {best.get('gray_ncc', 0):.2f}",
             f"Median: {m1[0]:.1f}px",
-            f"Core: {m1[5]:.2f}",
-            f"Orient: {m1[6]:.2f}",
-            f"Cov: {m1[3]:.2f}"
+            f"Core: {m1[5]:.2f}  Orient: {m1[6]:.2f}",
+            f"Cov: {m1[3]:.2f}",
+            f"Chain: {_cs1:.2f} ({_cn1} contours)"
         ]
         for i, txt in enumerate(text1):
             cv2.putText(canvas, txt, (w_f + 10, 30 + i*25),
@@ -2117,10 +2258,11 @@ class DroneLocalizer:
         uniqueness_color = (0, 255, 0) if uniqueness_reason == "OK" else (0, 0, 255)
         gt_color = (0, 255, 0) if is_valid_gt else (0, 165, 255)
 
+        _chain_str = f"Chain: {best.get('chain_score', 0):.2f}" if best else "Chain: N/A"
         summary_lines = [
-            f"Frame {frame_idx}  |  Uniqueness: {uniqueness_reason}  |  MultiPatch STD: {multipatch_std:.1f}px",
+            f"Frame {frame_idx}  |  Uniqueness: {uniqueness_reason}  |  {_chain_str}  |  MP STD: {multipatch_std:.1f}px",
             f"GT: {'YES' if is_valid_gt else 'NO'}  |  Reject: {', '.join(reject_reasons) if reject_reasons else 'N/A'}",
-            f"Candidates: {len(verified_candidates)}"
+            f"Candidates: {len(verified_candidates)}  |  NCC: {best.get('gray_ncc', 0):.2f}" if best else f"Candidates: 0"
         ]
 
         for i, txt in enumerate(summary_lines):
