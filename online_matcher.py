@@ -1826,6 +1826,10 @@ class DroneLocalizer:
                     _gt_tile["x"] + best_match["x"],
                     _gt_tile["y"] + best_match["y"]
                 )
+
+                # --- Visual tracking chain: use last GT as prior for next frame ---
+                # Critical when no GPS/SRT available - narrows search to nearby tiles
+                self._prior_px = self.last_global_pos
                 
                 _sf = verified_candidates[0]['score_final']
                 _gncc = verified_candidates[0]['gray_ncc']
