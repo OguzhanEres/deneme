@@ -192,13 +192,10 @@ class SIFTMatcher:
         self.tile_size = 0
         self.stride = 0
 
-        # SIFT detector for frames (more octave layers for better cross-scale matching)
-        self.sift = cv2.SIFT_create(
-            nfeatures=cfg.sift_max_keypoints,
-            nOctaveLayers=4,        # default=3, more layers = better scale matching
-            contrastThreshold=0.03,  # slightly lower to get more features
-            edgeThreshold=15,        # slightly higher to keep more features
-        )
+        # SIFT detector for frames
+        # CRITICAL: must use same params as tile processor (sift_map_processor.py line 70)
+        # otherwise descriptors won't match!
+        self.sift = cv2.SIFT_create(nfeatures=cfg.sift_max_keypoints)
 
         # BFMatcher as primary (more reliable than FLANN for cross-domain)
         self.bf_matcher = cv2.BFMatcher(cv2.NORM_L2)
