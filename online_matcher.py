@@ -104,18 +104,18 @@ SKIP_SECONDS = 35 # Skip takeoff sequence
 
 # --- Uniqueness gate thresholds (ratio-based + absolute) ---
 # --- Uniqueness gate thresholds (ratio-based + absolute) ---
-UNIQUENESS_MEDIAN_RATIO = 1.10   # median2/median1 must be >= this (lowered for more matches)
-UNIQUENESS_MEDIAN_DIFF  = 0.2    # OR median2 - median1 must be >= this (lowered)
-UNIQUENESS_CORE_DIFF    = 0.02   # core_ratio1 - core_ratio2 must be >= this (lowered)
-UNIQUENESS_SCORE_RATIO  = 1.03   # score1/score2 must be >= this (lowered)
+UNIQUENESS_MEDIAN_RATIO = 1.25   # median2/median1 must be >= this (INCREASED to reduce false positives)
+UNIQUENESS_MEDIAN_DIFF  = 0.4    # OR median2 - median1 must be >= this (INCREASED)
+UNIQUENESS_CORE_DIFF    = 0.05   # core_ratio1 - core_ratio2 must be >= this (INCREASED)
+UNIQUENESS_SCORE_RATIO  = 1.10   # score1/score2 must be >= this (INCREASED)
 
 # --- Orientation gate (tightened for GT mode) ---
 ORIENTED_CORE_RATIO_MIN  = 0.10  # min fraction of edges with matching gradient direction
 GRADIENT_ANGLE_THRESH_DEG = 15.0 # max |delta_theta| for oriented inlier
 
 # --- Gray NCC secondary score ---
-GRAY_NCC_WEIGHT   = 0.4          # weight for grayscale NCC in combined score
-EDGE_SCORE_WEIGHT = 0.6          # weight for edge/DT coarse score
+GRAY_NCC_WEIGHT   = 0.6          # weight for grayscale NCC (INCREASED for better texture discrimination)
+EDGE_SCORE_WEIGHT = 0.4          # weight for edge/DT coarse score (DECREASED)
 
 # --- Line-only verify ---
 LINE_MIN_LENGTH = 200            # min line segment length (px) – raised for road/canal only
@@ -124,8 +124,8 @@ LINE_TOP_N      = 20             # keep only this many longest lines
 # --- Multi-patch consistency (anchor + local refine) ---
 MULTI_PATCH_ENABLED  = True      # enable 5-patch position consistency check
 MULTI_PATCH_MARGIN   = 0.15      # fraction from each edge for corner patches
-MULTI_PATCH_POS_THR  = 200        # max pos_std across patches (pixels)
-MULTI_PATCH_ANG_THR  = 8.0       # max std(angle) across patches (degrees)
+MULTI_PATCH_POS_THR  = 150        # max pos_std across patches (pixels) - TIGHTENED
+MULTI_PATCH_ANG_THR  = 5.0       # max std(angle) across patches (degrees) - TIGHTENED
 MULTI_PATCH_LOCAL_R  = 256       # search radius around anchor (map pixels)
 MULTI_PATCH_SIZE     = 0.60      # patch size as fraction of frame dimension
 
@@ -1732,6 +1732,15 @@ class DroneLocalizer:
                     # failed relaxed gates -> break the temporal buffer
                     pending_streak.clear()
                     reject_reason.append("RELAXED_GATE")
+
+            # --- DEBUG: Save comparison visualization (every frame with candidates) ---
+            if len(verified_candidates) > 0:
+                self._save_debug_comparison(
+                    frame_idx, edges, verified_candidates,
+                    uniqueness_reason, multipatch_pos_std,
+                    is_valid_gt, reject_reason
+                )
+
             output = frame.copy()
 
             # --- Write ALL frames to all_matches.csv ---
@@ -1985,6 +1994,124 @@ class DroneLocalizer:
                 matches.append((i, best_idx))
                 
         return matches
+
+    def _save_debug_comparison(self, frame_idx, frame_edges, verified_candidates,
+                               uniqueness_reason, multipatch_std, is_valid_gt, reject_reasons):
+        """
+        Save debug visualization comparing top-2 candidates side-by-side.
+        Helps identify false positives and ambiguous matches.
+        """
+        import os
+        debug_dir = "debug_output"
+        os.makedirs(debug_dir, exist_ok=True)
+
+        if len(verified_candidates) == 0:
+            return
+
+        # Get top-2 candidates
+        best = verified_candidates[0]
+        second = verified_candidates[1] if len(verified_candidates) >= 2 else None
+
+        # Create canvas: [Frame | Tile-1 | Tile-2]
+        h_f, w_f = frame_edges.shape
+        canvas_h = h_f * 2
+        canvas_w = w_f * 3
+        canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+
+        # --- Top-left: Frame edges (GREEN) ---
+        frame_vis = cv2.cvtColor(frame_edges, cv2.COLOR_GRAY2BGR)
+        frame_vis[frame_edges > 0] = [0, 255, 0]  # green edges
+        canvas[0:h_f, 0:w_f] = frame_vis
+        cv2.putText(canvas, "FRAME EDGES", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                   0.8, (0, 255, 0), 2)
+
+        # --- Top-middle: Best candidate tile edges (CYAN) ---
+        tile1_data = self.get_tile_data(best["cand"]["tile_idx"])
+        tile1_gray = tile1_data["gray"]
+
+        # Extract ROI from tile matching the frame
+        x1, y1 = best["cand"]["x"], best["cand"]["y"]
+        w1, h1 = best["cand"]["w"], best["cand"]["h"]
+
+        # Compute edges from tile gray for visualization
+        tile1_edges = cv2.Canny(tile1_gray[y1:y1+h1, x1:x1+w1], 80, 200)
+        tile1_edges_resized = cv2.resize(tile1_edges, (w_f, h_f))
+
+        tile1_vis = cv2.cvtColor(tile1_edges_resized, cv2.COLOR_GRAY2BGR)
+        tile1_vis[tile1_edges_resized > 0] = [255, 255, 0]  # cyan edges
+        canvas[0:h_f, w_f:w_f*2] = tile1_vis
+
+        # Metrics text for best
+        m1 = best["metrics"]
+        score1 = best["score_final"]
+        text1 = [
+            f"BEST (Tile {best['cand']['tile_idx']})",
+            f"Score: {score1:.3f}",
+            f"Median: {m1[0]:.1f}px",
+            f"Core: {m1[5]:.2f}",
+            f"Orient: {m1[6]:.2f}",
+            f"Cov: {m1[3]:.2f}"
+        ]
+        for i, txt in enumerate(text1):
+            cv2.putText(canvas, txt, (w_f + 10, 30 + i*25),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+        # --- Top-right: Second candidate tile edges (MAGENTA) if exists ---
+        if second is not None:
+            tile2_data = self.get_tile_data(second["cand"]["tile_idx"])
+            tile2_gray = tile2_data["gray"]
+
+            x2, y2 = second["cand"]["x"], second["cand"]["y"]
+            w2, h2 = second["cand"]["w"], second["cand"]["h"]
+
+            tile2_edges = cv2.Canny(tile2_gray[y2:y2+h2, x2:x2+w2], 80, 200)
+            tile2_edges_resized = cv2.resize(tile2_edges, (w_f, h_f))
+
+            tile2_vis = cv2.cvtColor(tile2_edges_resized, cv2.COLOR_GRAY2BGR)
+            tile2_vis[tile2_edges_resized > 0] = [255, 0, 255]  # magenta edges
+            canvas[0:h_f, w_f*2:w_f*3] = tile2_vis
+
+            # Metrics text for second
+            m2 = second["metrics"]
+            score2 = second["score_final"]
+            text2 = [
+                f"2ND (Tile {second['cand']['tile_idx']})",
+                f"Score: {score2:.3f}",
+                f"Median: {m2[0]:.1f}px",
+                f"Core: {m2[5]:.2f}",
+                f"Orient: {m2[6]:.2f}",
+                f"Cov: {m2[3]:.2f}"
+            ]
+            for i, txt in enumerate(text2):
+                cv2.putText(canvas, txt, (w_f*2 + 10, 30 + i*25),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+
+        # --- Bottom: Summary info ---
+        summary_y = h_f + 30
+        uniqueness_color = (0, 255, 0) if uniqueness_reason == "OK" else (0, 0, 255)
+        gt_color = (0, 255, 0) if is_valid_gt else (0, 165, 255)
+
+        summary_lines = [
+            f"Frame {frame_idx}  |  Uniqueness: {uniqueness_reason}  |  MultiPatch STD: {multipatch_std:.1f}px",
+            f"GT: {'YES' if is_valid_gt else 'NO'}  |  Reject: {', '.join(reject_reasons) if reject_reasons else 'N/A'}",
+            f"Candidates: {len(verified_candidates)}"
+        ]
+
+        for i, txt in enumerate(summary_lines):
+            color = gt_color if i == 1 else uniqueness_color if i == 0 else (255, 255, 255)
+            cv2.putText(canvas, txt, (10, summary_y + i*30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+        # Save to file
+        filename = os.path.join(debug_dir, f"frame_{frame_idx:05d}_debug.jpg")
+        cv2.imwrite(filename, canvas)
+
+        # Also save rejected GT frames separately for analysis
+        if not is_valid_gt and len(verified_candidates) > 0:
+            reject_dir = os.path.join(debug_dir, "rejected_gt")
+            os.makedirs(reject_dir, exist_ok=True)
+            reject_file = os.path.join(reject_dir, f"frame_{frame_idx:05d}_REJECT.jpg")
+            cv2.imwrite(reject_file, canvas)
 
     def visualize_match(self, frame_img, frame_lines, match):
         if not match: return
