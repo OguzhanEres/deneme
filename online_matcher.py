@@ -116,6 +116,11 @@ GRADIENT_ANGLE_THRESH_DEG = 15.0 # max |delta_theta| for oriented inlier
 # --- Gray NCC secondary score ---
 GRAY_NCC_WEIGHT   = 0.6          # weight for grayscale NCC (INCREASED for better texture discrimination)
 EDGE_SCORE_WEIGHT = 0.4          # weight for edge/DT coarse score (DECREASED)
+GRAY_NCC_MIN_GATE = 0.25         # minimum NCC for GT acceptance (texture must actually match!)
+
+# --- Edge density gate (skip featureless frames) ---
+EDGE_DENSITY_MIN  = 0.004        # minimum edge pixel ratio (edge_pixels / total_pixels)
+                                  # frames with fewer edges are too featureless for reliable matching
 
 # --- Line-only verify ---
 LINE_MIN_LENGTH = 200            # min line segment length (px) – raised for road/canal only
@@ -1304,7 +1309,18 @@ class DroneLocalizer:
 
             t0 = time.time()
             enhanced, edges, frame_lines, edge_before, edge_after = self.preprocess_frame(frame)
-            
+
+            # --- Edge density gate: skip featureless frames ---
+            fh_check, fw_check = edges.shape[:2]
+            edge_density = edge_after / max(fh_check * fw_check, 1)
+            if edge_density < EDGE_DENSITY_MIN:
+                print(f"[SKIP] Frame {frame_idx}: edge density {edge_density:.4f} < {EDGE_DENSITY_MIN} (featureless)")
+                pending_streak.clear()
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+                continue
+
             # --- Edge accumulation: OR last N frames ---
             self._edge_ring.append(edges.copy())
             if len(self._edge_ring) > EDGE_ACCUM_N:
@@ -1717,7 +1733,13 @@ class DroneLocalizer:
                         gt_ok = False
                         reject_reason.append("ANCHOR")
 
-                    # 11) Temporal consistency check (spatial jump between frames)
+                    # 11) NCC texture gate: frame & tile must actually look alike
+                    _best_ncc = verified_candidates[0]["gray_ncc"] if verified_candidates else 0.0
+                    if _best_ncc < GRAY_NCC_MIN_GATE:
+                        gt_ok = False
+                        reject_reason.append("NCC_LOW")
+
+                    # 12) Temporal consistency check (spatial jump between frames)
                     if gt_ok:
                         if not self.check_temporal_consistency(match_data, pending_streak[:-1], required_n=GT_LOCK_N):
                             gt_ok = False
