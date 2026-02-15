@@ -123,9 +123,11 @@ EDGE_DENSITY_MIN  = 0.004        # minimum edge pixel ratio (edge_pixels / total
                                   # frames with fewer edges are too featureless for reliable matching
 
 # --- Contour chain consistency (shoreline matching) ---
-CONTOUR_MIN_ARC       = 60       # minimum contour arc length (px) to be considered
-CONTOUR_CHAIN_MIN     = 0.55     # minimum chain consistency score for GT acceptance
-CONTOUR_LABEL_THICK   = 7        # label map dilation thickness (tolerance for projection error)
+CONTOUR_MIN_ARC       = 150      # minimum contour arc length (px) - INCREASED to filter noise
+CONTOUR_CHAIN_MIN     = 0.40     # minimum chain consistency score for GT acceptance
+CONTOUR_LABEL_THICK   = 3        # label map thickness (THIN - must be precise)
+CONTOUR_TOP_N         = 15       # only use top-N longest contours (discard small fragments)
+CONTOUR_SHAPE_PENALTY = 0.6      # penalize chain if shape doesn't match (matchShapes > this)
 
 # --- Line-only verify ---
 LINE_MIN_LENGTH = 200            # min line segment length (px) – raised for road/canal only
@@ -706,37 +708,33 @@ class DroneLocalizer:
 
     def _contour_chain_verify(self, tile_data, frame_edges, match, fh, fw):
         """
-        Contour chain consistency: do frame contour shapes map onto
-        consistent tile contour shapes?
+        Contour chain consistency with SHAPE comparison.
 
-        Logic:
-        1. Extract frame contours (polylines = "shorelines")
-        2. Extract tile contours from DT (dt < 1.0 = edge pixels)
-        3. Build tile contour label map (each contour = unique label)
-        4. Project frame contour points to tile space
-        5. For each frame contour, check if projected points hit the
-           SAME tile contour (chain consistency)
-
-        A high score means frame shapes are preserved in the tile.
-        A low score means frame edges scatter across unrelated tile edges.
+        For each major frame contour:
+        1. Project it to tile space
+        2. Find which tile contour it overlaps with (label map)
+        3. Compare SHAPES using cv2.matchShapes (Hu moments)
+        4. Chain is "consistent" only if it hits one tile contour AND shapes match
 
         Returns: (chain_score, n_frame_contours)
         """
         from collections import Counter
 
-        # 1. Frame contours
+        # 1. Frame contours (only top-N longest)
         frame_contours = self._extract_major_contours(frame_edges)
+        frame_contours = frame_contours[:CONTOUR_TOP_N]
         if len(frame_contours) < 2:
             return 0.0, len(frame_contours)
 
-        # 2. Tile edges from DT
+        # 2. Tile edges from DT (dt < 1.0 = edge pixel)
         dt = tile_data["dt"]
         tile_edges = (dt < 1.0).astype(np.uint8) * 255
         tile_contours = self._extract_major_contours(tile_edges)
+        tile_contours = tile_contours[:CONTOUR_TOP_N]
         if len(tile_contours) < 2:
             return 0.0, len(frame_contours)
 
-        # 3. Build tile contour label map
+        # 3. Build THIN tile contour label map
         label_map = np.zeros(dt.shape, dtype=np.int32)
         for i, tc in enumerate(tile_contours):
             cv2.drawContours(label_map, [tc], -1, i + 1,
@@ -769,16 +767,39 @@ class DroneLocalizer:
 
             labels = label_map[valid_pts[:, 1], valid_pts[:, 0]]
             labels = labels[labels > 0]
+
+            # --- HIT RATIO: what fraction of points even land on a tile contour? ---
+            hit_ratio = len(labels) / max(len(valid_pts), 1)
+
             if len(labels) < 3:
+                # Most points don't hit any tile contour → bad alignment
+                weight = cv2.arcLength(fc, False)
+                total_weighted += 0.0  # zero score for this contour
+                total_weight += weight
                 continue
 
             # Chain consistency: fraction hitting the dominant tile contour
             counter = Counter(labels.tolist())
+            dominant_label = counter.most_common(1)[0][0]
             dominant_count = counter.most_common(1)[0][1]
-            consistency = dominant_count / len(labels)
+            chain_consistency = dominant_count / len(labels)
+
+            # --- SHAPE COMPARISON: does this frame contour LOOK like the tile contour? ---
+            shape_score = 1.0  # default: good
+            if dominant_label - 1 < len(tile_contours):
+                matched_tile_contour = tile_contours[dominant_label - 1]
+                # matchShapes returns 0 for identical shapes, higher = more different
+                shape_dist = cv2.matchShapes(fc, matched_tile_contour, cv2.CONTOURS_MATCH_I2, 0)
+                # Penalize if shapes are very different
+                if shape_dist > CONTOUR_SHAPE_PENALTY:
+                    shape_score = max(0.0, 1.0 - (shape_dist - CONTOUR_SHAPE_PENALTY))
+
+            # Combined score for this contour:
+            # chain_consistency * hit_ratio * shape_score
+            contour_score = chain_consistency * hit_ratio * shape_score
 
             weight = cv2.arcLength(fc, False)
-            total_weighted += consistency * weight
+            total_weighted += contour_score * weight
             total_weight += weight
 
         if total_weight < 1.0:
