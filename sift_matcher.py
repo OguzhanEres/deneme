@@ -126,9 +126,11 @@ class Config:
     edge_density_min: float = 0.004  # skip featureless frames
     roi_px: int = 1100               # prior-based search radius (pixels)
 
-    # Debug
+    # Debug / visualization
     save_debug: bool = True
     debug_dir: str = "debug_sift"
+    live_view: bool = False           # show cv2.imshow live windows
+    live_wait_ms: int = 1             # waitKey delay (1=fast, 0=pause each frame)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -837,6 +839,153 @@ class SIFTMatcher:
 
             cv2.imwrite(os.path.join(out_dir, f"frame_{frame_idx:05d}.jpg"), overlay_small)
 
+    # ── Live Visualization ────────────────────────────────────────────────
+
+    def show_live(self, frame_idx, frame_gray, best_metrics, all_verified,
+                  frame_kps, is_gt, reject_reasons, n_frame_kps, elapsed):
+        """
+        Show real-time matching visualization with cv2.imshow.
+        Two windows:
+          - 'SIFT Matches': side-by-side frame & tile with match lines
+          - 'Overlay': warped frame blended on tile
+        Press 'q' to quit, SPACE to pause/resume, +/- for speed.
+        Returns False if user pressed 'q'.
+        """
+        if not self.cfg.live_view:
+            return True
+
+        frame_h, frame_w = frame_gray.shape[:2]
+
+        # === Window 1: Match lines (or "no match" view) ===
+        if best_metrics is not None and best_metrics.get("match_result"):
+            match_result = best_metrics["match_result"]
+            tile_idx = best_metrics["tile_idx"]
+            tile_data = self.get_tile_data(tile_idx)
+            tile_gray = tile_data["gray"]
+            tile_kps = tile_data["keypoints"]
+            tile_id = self.tiles[tile_idx]["id"]
+            H = match_result["H"]
+            good_matches = match_result["matches"]
+            inlier_mask = match_result["inlier_mask"]
+
+            frame_bgr = cv2.cvtColor(frame_gray, cv2.COLOR_GRAY2BGR)
+            tile_bgr = cv2.cvtColor(tile_gray, cv2.COLOR_GRAY2BGR)
+
+            # Separate inliers/outliers
+            inlier_matches = [m for i, m in enumerate(good_matches) if inlier_mask[i]]
+            outlier_matches = [m for i, m in enumerate(good_matches) if not inlier_mask[i]]
+
+            # Draw outliers (red, thin)
+            match_img = cv2.drawMatches(
+                frame_bgr, frame_kps,
+                tile_bgr, tile_kps,
+                outlier_matches, None,
+                matchColor=(0, 0, 150),
+                singlePointColor=(80, 80, 80),
+                flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+
+            # Draw inliers on top (green)
+            match_img = cv2.drawMatches(
+                frame_bgr, frame_kps,
+                tile_bgr, tile_kps,
+                inlier_matches, match_img,
+                matchColor=(0, 255, 0),
+                singlePointColor=(0, 200, 0),
+                flags=(cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS |
+                       cv2.DrawMatchesFlags_DRAW_OVER_OUTIMG))
+
+            # Status bar on top
+            status_color = (0, 255, 0) if is_gt else (0, 0, 255) if reject_reasons else (0, 255, 255)
+            status_text = "GT" if is_gt else f"REJECT: {';'.join(reject_reasons[:3])}"
+            cv2.rectangle(match_img, (0, 0), (match_img.shape[1], 95), (0, 0, 0), -1)
+            cv2.putText(match_img, f"F{frame_idx} {status_text} | {tile_id}",
+                        (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+            cv2.putText(match_img,
+                        f"Inliers: {best_metrics['n_inliers']}/{best_metrics['n_total_matches']}  "
+                        f"NCC: {best_metrics['ncc']:.3f}  SSIM: {best_metrics['ssim']:.3f}  "
+                        f"Reproj: {best_metrics['reproj_error']:.1f}px",
+                        (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 1)
+            cv2.putText(match_img,
+                        f"Scale: {best_metrics['scale']:.3f}  Rot: {best_metrics['rotation']:.1f}  "
+                        f"Cov: {best_metrics['coverage']:.2f}  KPs: {n_frame_kps}  [{elapsed:.2f}s]",
+                        (10, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+
+            # Resize to fit screen (max width 1600)
+            mh, mw = match_img.shape[:2]
+            if mw > 1600:
+                scale = 1600 / mw
+                match_img = cv2.resize(match_img, (1600, int(mh * scale)))
+
+            cv2.imshow("SIFT Matches", match_img)
+
+            # === Window 2: Overlay ===
+            tile_h, tile_w = tile_gray.shape[:2]
+            warped = cv2.warpPerspective(frame_gray, H, (tile_w, tile_h),
+                                         borderMode=cv2.BORDER_CONSTANT,
+                                         borderValue=0)
+            warp_mask = warped > 0
+
+            overlay = cv2.cvtColor(tile_gray, cv2.COLOR_GRAY2BGR)
+            warped_bgr = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
+            overlay[warp_mask] = cv2.addWeighted(
+                overlay[warp_mask], 0.5, warped_bgr[warp_mask], 0.5, 0)
+
+            # Frame boundary
+            corners = np.float32([
+                [0, 0], [frame_w, 0], [frame_w, frame_h], [0, frame_h]
+            ]).reshape(-1, 1, 2)
+            mapped = cv2.perspectiveTransform(corners, H).astype(np.int32)
+            cv2.polylines(overlay, [mapped], True, (0, 0, 255), 3)
+
+            # Inlier dots
+            inlier_pts = match_result["dst_pts"][inlier_mask].reshape(-1, 2)
+            for pt in inlier_pts[:200]:
+                cv2.circle(overlay, (int(pt[0]), int(pt[1])), 4, (0, 255, 0), -1)
+
+            # Resize overlay to ~800px height
+            oh, ow = overlay.shape[:2]
+            scale_o = 800 / max(oh, 1)
+            overlay_small = cv2.resize(overlay, (int(ow * scale_o), 800))
+
+            cv2.putText(overlay_small, f"F{frame_idx} | {tile_id} | {status_text}",
+                        (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+
+            cv2.imshow("Overlay", overlay_small)
+
+        else:
+            # No match - show frame only with "NO MATCH" label
+            frame_bgr = cv2.cvtColor(frame_gray, cv2.COLOR_GRAY2BGR)
+            if frame_bgr.shape[0] > 800:
+                scale = 800 / frame_bgr.shape[0]
+                frame_bgr = cv2.resize(frame_bgr, (0, 0), fx=scale, fy=scale)
+
+            cv2.rectangle(frame_bgr, (0, 0), (frame_bgr.shape[1], 50), (0, 0, 0), -1)
+            cv2.putText(frame_bgr,
+                        f"F{frame_idx} NO MATCH | kps={n_frame_kps} [{elapsed:.2f}s]",
+                        (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+            cv2.imshow("SIFT Matches", frame_bgr)
+
+        # Key handling
+        key = cv2.waitKey(self.cfg.live_wait_ms) & 0xFF
+        if key == ord('q'):
+            print("\n[LIVE] User pressed 'q' - stopping.")
+            return False
+        elif key == ord(' '):
+            # Pause - wait until next key
+            print("[LIVE] Paused. Press any key to continue, 'q' to quit.")
+            key2 = cv2.waitKey(0) & 0xFF
+            if key2 == ord('q'):
+                return False
+        elif key == ord('+') or key == ord('='):
+            self.cfg.live_wait_ms = max(1, self.cfg.live_wait_ms // 2)
+            print(f"[LIVE] Speed up: wait={self.cfg.live_wait_ms}ms")
+        elif key == ord('-'):
+            self.cfg.live_wait_ms = min(2000, self.cfg.live_wait_ms * 2)
+            print(f"[LIVE] Slow down: wait={self.cfg.live_wait_ms}ms")
+
+        return True
+
     # ── Main Pipeline ────────────────────────────────────────────────────
 
     def process_frame(self, frame_gray, roi_mask, frame_kps=None, frame_descs=None):
@@ -1159,7 +1308,17 @@ class SIFTMatcher:
             print(f"  F{frame_idx} {status} kps={n_frame_kps} {metrics_str} "
                   f"[{elapsed:.2f}s] GT#{gt_count}")
 
+            # === Live Visualization ===
+            if self.cfg.live_view:
+                keep_going = self.show_live(
+                    frame_idx, enhanced, best_metrics, all_verified,
+                    frame_kps, is_gt, reject_reasons, n_frame_kps, elapsed)
+                if not keep_going:
+                    break
+
         cap.release()
+        if self.cfg.live_view:
+            cv2.destroyAllWindows()
         gt_file.close()
         all_file.close()
 
@@ -1188,6 +1347,10 @@ def main():
     parser.add_argument("--gt-lock-n", type=int, default=2, help="Consecutive frames for GT")
     parser.add_argument("--no-debug", action="store_true", help="Disable debug images")
     parser.add_argument("--roi-px", type=int, default=1100, help="Prior ROI radius (pixels)")
+    parser.add_argument("--live", action="store_true",
+                        help="Enable live cv2.imshow visualization (q=quit, SPACE=pause, +/-=speed)")
+    parser.add_argument("--live-wait", type=int, default=1,
+                        help="Live view waitKey delay in ms (1=fast, 0=pause each frame)")
 
     args = parser.parse_args()
 
@@ -1202,6 +1365,8 @@ def main():
         gt_lock_n=args.gt_lock_n,
         save_debug=not args.no_debug,
         roi_px=args.roi_px,
+        live_view=args.live,
+        live_wait_ms=args.live_wait,
     )
 
     matcher = SIFTMatcher(cfg)
