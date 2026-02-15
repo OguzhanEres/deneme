@@ -463,29 +463,43 @@ class SIFTMatcher:
         frame_rsift = self.rootsift_transform(frame_descs)
         tile_rsift = self.rootsift_transform(tile_descs)
 
-        # BFMatcher knnMatch (more reliable than FLANN for cross-domain matching)
+        # Forward knnMatch (frame → tile)
         try:
-            raw_matches = self.bf_matcher.knnMatch(
-                frame_rsift, tile_rsift, k=2)
+            fwd_matches = self.bf_matcher.knnMatch(frame_rsift, tile_rsift, k=2)
         except cv2.error as e:
             if verbose:
                 print(f"    [{tile_id}] BFMatcher error: {e}")
             return None
 
-        # Lowe's ratio test
+        # Backward match (tile → frame) for mutual nearest neighbor check
+        try:
+            bwd_matches = self.bf_matcher.match(tile_rsift, frame_rsift)
+        except cv2.error:
+            bwd_matches = []
+
+        # Build reverse lookup: tile_desc_idx -> best frame_desc_idx
+        bwd_map = {}
+        for m in bwd_matches:
+            bwd_map[m.queryIdx] = m.trainIdx
+
+        # Lowe's ratio test + Mutual Nearest Neighbor filter
         good_matches = []
-        n_single = 0  # pairs with only 1 match (no ratio test possible)
-        for pair in raw_matches:
+        n_ratio_only = 0
+        n_single = 0
+        for pair in fwd_matches:
             if len(pair) == 2:
                 m, n = pair
                 if m.distance < self.cfg.lowe_ratio * n.distance:
-                    good_matches.append(m)
+                    n_ratio_only += 1
+                    # MNN check: tile's best match for m.trainIdx must be m.queryIdx
+                    if bwd_map.get(m.trainIdx) == m.queryIdx:
+                        good_matches.append(m)
             elif len(pair) == 1:
                 n_single += 1
 
         if verbose or len(good_matches) < self.cfg.min_inliers:
-            print(f"    [{tile_id}] raw={len(raw_matches)} ratio_pass={len(good_matches)} "
-                  f"single={n_single} tile_kps={len(tile_kps)}")
+            print(f"    [{tile_id}] raw={len(fwd_matches)} ratio={n_ratio_only} "
+                  f"mnn={len(good_matches)} single={n_single} tile_kps={len(tile_kps)}")
 
         if len(good_matches) < self.cfg.min_inliers:
             return None
@@ -498,7 +512,7 @@ class SIFTMatcher:
         try:
             H, mask = cv2.findHomography(
                 src_pts, dst_pts, cv2.USAC_MAGSAC, self.cfg.ransac_reproj_thresh,
-                maxIters=5000, confidence=0.999)
+                maxIters=10000, confidence=0.9999)
         except cv2.error:
             # Fallback to standard RANSAC if USAC not available
             H, mask = cv2.findHomography(
@@ -942,8 +956,11 @@ class SIFTMatcher:
 
             overlay = cv2.cvtColor(tile_gray, cv2.COLOR_GRAY2BGR)
             warped_bgr = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
-            overlay[warp_mask] = cv2.addWeighted(
-                overlay[warp_mask], 0.5, warped_bgr[warp_mask], 0.5, 0)
+            if warp_mask.any():
+                blended = cv2.addWeighted(
+                    overlay[warp_mask], 0.5, warped_bgr[warp_mask], 0.5, 0)
+                if blended is not None:
+                    overlay[warp_mask] = blended
 
             # Frame boundary
             corners = np.float32([
