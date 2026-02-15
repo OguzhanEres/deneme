@@ -107,7 +107,7 @@ class Config:
     sift_max_keypoints: int = 4000    # for frame
     lowe_ratio: float = 0.90         # Lowe's ratio test (very relaxed for cross-domain)
     min_inliers: int = 8             # min RANSAC inliers for valid match
-    ransac_reproj_thresh: float = 10.0 # RANSAC reprojection threshold (px)
+    ransac_reproj_thresh: float = 15.0 # RANSAC reprojection threshold (px, relaxed for cross-domain)
 
     # Verification thresholds
     min_ncc: float = 0.15            # grayscale NCC minimum (relaxed for cross-domain)
@@ -435,6 +435,15 @@ class SIFTMatcher:
 
     # ── Phase 2: SIFT Matching + Homography ──────────────────────────────
 
+    @staticmethod
+    def rootsift_transform(descs):
+        """Convert SIFT descriptors to RootSIFT (Hellinger kernel).
+        L1-normalize then take element-wise sqrt. Use with L2 distance."""
+        descs = descs.astype(np.float32)
+        l1_norms = np.abs(descs).sum(axis=1, keepdims=True)
+        descs = descs / np.maximum(l1_norms, 1e-7)
+        return np.sqrt(descs)
+
     def match_tile(self, frame_kps, frame_descs, tile_idx, verbose=False):
         """
         Match frame SIFT features against a single tile.
@@ -450,11 +459,14 @@ class SIFTMatcher:
                 print(f"    [{tile_id}] Too few descriptors: tile={len(tile_descs)} frame={len(frame_descs)}")
             return None
 
+        # RootSIFT: L1-normalize + sqrt for better cross-domain matching
+        frame_rsift = self.rootsift_transform(frame_descs)
+        tile_rsift = self.rootsift_transform(tile_descs)
+
         # BFMatcher knnMatch (more reliable than FLANN for cross-domain matching)
         try:
             raw_matches = self.bf_matcher.knnMatch(
-                frame_descs.astype(np.float32),
-                tile_descs.astype(np.float32), k=2)
+                frame_rsift, tile_rsift, k=2)
         except cv2.error as e:
             if verbose:
                 print(f"    [{tile_id}] BFMatcher error: {e}")
@@ -482,9 +494,15 @@ class SIFTMatcher:
         src_pts = np.float32([frame_kps[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
         dst_pts = np.float32([tile_kps[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
 
-        # RANSAC homography
-        H, mask = cv2.findHomography(
-            src_pts, dst_pts, cv2.RANSAC, self.cfg.ransac_reproj_thresh)
+        # RANSAC homography (USAC_MAGSAC for better outlier handling)
+        try:
+            H, mask = cv2.findHomography(
+                src_pts, dst_pts, cv2.USAC_MAGSAC, self.cfg.ransac_reproj_thresh,
+                maxIters=5000, confidence=0.999)
+        except cv2.error:
+            # Fallback to standard RANSAC if USAC not available
+            H, mask = cv2.findHomography(
+                src_pts, dst_pts, cv2.RANSAC, self.cfg.ransac_reproj_thresh)
 
         if H is None:
             if verbose:
