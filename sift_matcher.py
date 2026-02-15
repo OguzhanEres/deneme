@@ -105,16 +105,16 @@ class Config:
 
     # SIFT matching
     sift_max_keypoints: int = 4000    # for frame
-    lowe_ratio: float = 0.75         # Lowe's ratio test
-    min_inliers: int = 15            # min RANSAC inliers for valid match
-    ransac_reproj_thresh: float = 5.0 # RANSAC reprojection threshold (px)
+    lowe_ratio: float = 0.80         # Lowe's ratio test (relaxed for cross-domain)
+    min_inliers: int = 10            # min RANSAC inliers for valid match
+    ransac_reproj_thresh: float = 8.0 # RANSAC reprojection threshold (px)
 
     # Verification thresholds
-    min_ncc: float = 0.25            # grayscale NCC minimum
-    min_ssim: float = 0.20           # structural similarity minimum
-    min_inlier_ratio: float = 0.10   # inliers / total matches
-    max_reproj_error: float = 8.0    # mean reprojection error (px)
-    min_coverage: float = 0.30       # spatial coverage of inliers (0-1)
+    min_ncc: float = 0.15            # grayscale NCC minimum (relaxed for cross-domain)
+    min_ssim: float = 0.10           # structural similarity minimum
+    min_inlier_ratio: float = 0.08   # inliers / total matches
+    max_reproj_error: float = 12.0   # mean reprojection error (px)
+    min_coverage: float = 0.15       # spatial coverage of inliers (0-1)
 
     # Temporal
     gt_lock_n: int = 2               # consecutive frames for GT write
@@ -190,10 +190,18 @@ class SIFTMatcher:
         self.tile_size = 0
         self.stride = 0
 
-        # SIFT detector for frames
-        self.sift = cv2.SIFT_create(nfeatures=cfg.sift_max_keypoints)
+        # SIFT detector for frames (more octave layers for better cross-scale matching)
+        self.sift = cv2.SIFT_create(
+            nfeatures=cfg.sift_max_keypoints,
+            nOctaveLayers=4,        # default=3, more layers = better scale matching
+            contrastThreshold=0.03,  # slightly lower to get more features
+            edgeThreshold=15,        # slightly higher to keep more features
+        )
 
-        # FLANN matcher (faster than BFMatcher for large descriptor sets)
+        # BFMatcher as primary (more reliable than FLANN for cross-domain)
+        self.bf_matcher = cv2.BFMatcher(cv2.NORM_L2)
+
+        # FLANN matcher as backup
         index_params = dict(algorithm=1, trees=5)  # FLANN_INDEX_KDTREE
         search_params = dict(checks=50)
         self.flann = cv2.FlannBasedMatcher(index_params, search_params)
@@ -329,20 +337,11 @@ class SIFTMatcher:
         else:
             kps, descs = [], np.zeros((0, 128), dtype=np.float32)
 
-        # Build FLANN index for this tile's descriptors
-        flann_index = None
-        if len(descs) >= 2:
-            flann_index = cv2.FlannBasedMatcher(
-                dict(algorithm=1, trees=5), dict(checks=50))
-            flann_index.add([descs.astype(np.float32)])
-            flann_index.train()
-
         result = {
             "info": tile,
             "gray": gray,
             "keypoints": kps,
             "descriptors": descs,
-            "flann_index": flann_index,
         }
         self.tile_cache[tile_idx] = result
         return result
@@ -366,15 +365,16 @@ class SIFTMatcher:
     def preprocess_frame(self, frame):
         """
         Preprocess frame for SIFT extraction.
+        Must match tile preprocessing (CLAHE only, NO sharpening)
+        to avoid descriptor domain gap.
         Returns: (enhanced_gray, roi_mask, edge_count)
         """
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
 
-        # Sharpen
-        gaussian = cv2.GaussianBlur(enhanced, (0, 0), 3.0)
-        enhanced = cv2.addWeighted(enhanced, 1.5, gaussian, -0.5, 0)
+        # NOTE: No sharpening here - must match tile preprocessing exactly
+        # (sift_map_processor.py uses CLAHE only)
 
         # ROI mask for SIFT (exclude propellers/body)
         h, w = enhanced.shape
@@ -436,37 +436,45 @@ class SIFTMatcher:
 
     # ── Phase 2: SIFT Matching + Homography ──────────────────────────────
 
-    def match_tile(self, frame_kps, frame_descs, tile_idx):
+    def match_tile(self, frame_kps, frame_descs, tile_idx, verbose=False):
         """
         Match frame SIFT features against a single tile.
-        Returns: (homography, inlier_mask, matches, tile_kps) or None
+        Returns: dict with H, inlier_mask, matches etc, or None
         """
         tile_data = self.get_tile_data(tile_idx)
         tile_descs = tile_data["descriptors"]
         tile_kps = tile_data["keypoints"]
+        tile_id = self.tiles[tile_idx]["id"]
 
         if len(tile_descs) < 10 or len(frame_descs) < 10:
+            if verbose:
+                print(f"    [{tile_id}] Too few descriptors: tile={len(tile_descs)} frame={len(frame_descs)}")
             return None
 
-        # FLANN matching with Lowe's ratio test
+        # BFMatcher knnMatch (more reliable than FLANN for cross-domain matching)
         try:
-            if tile_data["flann_index"] is not None:
-                raw_matches = tile_data["flann_index"].knnMatch(
-                    frame_descs.astype(np.float32), k=2)
-            else:
-                raw_matches = self.flann.knnMatch(
-                    frame_descs.astype(np.float32),
-                    tile_descs.astype(np.float32), k=2)
-        except cv2.error:
+            raw_matches = self.bf_matcher.knnMatch(
+                frame_descs.astype(np.float32),
+                tile_descs.astype(np.float32), k=2)
+        except cv2.error as e:
+            if verbose:
+                print(f"    [{tile_id}] BFMatcher error: {e}")
             return None
 
         # Lowe's ratio test
         good_matches = []
+        n_single = 0  # pairs with only 1 match (no ratio test possible)
         for pair in raw_matches:
             if len(pair) == 2:
                 m, n = pair
                 if m.distance < self.cfg.lowe_ratio * n.distance:
                     good_matches.append(m)
+            elif len(pair) == 1:
+                n_single += 1
+
+        if verbose or len(good_matches) < self.cfg.min_inliers:
+            print(f"    [{tile_id}] raw={len(raw_matches)} ratio_pass={len(good_matches)} "
+                  f"single={n_single} tile_kps={len(tile_kps)}")
 
         if len(good_matches) < self.cfg.min_inliers:
             return None
@@ -480,10 +488,15 @@ class SIFTMatcher:
             src_pts, dst_pts, cv2.RANSAC, self.cfg.ransac_reproj_thresh)
 
         if H is None:
+            if verbose:
+                print(f"    [{tile_id}] RANSAC failed (H is None) from {len(good_matches)} matches")
             return None
 
         inlier_mask = mask.ravel().astype(bool)
         n_inliers = int(inlier_mask.sum())
+
+        if verbose:
+            print(f"    [{tile_id}] inliers={n_inliers}/{len(good_matches)}")
 
         if n_inliers < self.cfg.min_inliers:
             return None
@@ -849,9 +862,15 @@ class SIFTMatcher:
             frame_descs, prior_px=self._prior_px)
 
         # Phase 2: Match against each candidate tile
+        # Enable verbose for first 5 calls to diagnose matching issues
+        if not hasattr(self, '_match_call_count'):
+            self._match_call_count = 0
+        self._match_call_count += 1
+        verbose = self._match_call_count <= 3
+
         all_results = []
         for tile_idx in candidate_tiles:
-            result = self.match_tile(frame_kps, frame_descs, tile_idx)
+            result = self.match_tile(frame_kps, frame_descs, tile_idx, verbose=verbose)
             if result is not None:
                 result["_frame_kps"] = frame_kps
                 all_results.append(result)
