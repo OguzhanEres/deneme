@@ -9,8 +9,8 @@ from rasterio.windows import Window
 # Settings
 MAP_PATH = "dikilitas_new.tif"
 OUTPUT_DIR = "processed_map"
-TILE_SIZE = 4096  # reasonable tile size for 6400x6400 map
-STRIDE = 512      # dense overlap → more tiles → better disambiguation
+TILE_SIZE = 3072  # covers drone FOV (~2500px at scale 0.35) with margin
+STRIDE = 1536     # 50% overlap for boundary handling
 
 def ensure_dir(d):
     if not os.path.exists(d):
@@ -24,7 +24,7 @@ def preprocess_tile(img):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     else:
         gray = img
-    
+
     # Check if tile has enough data (not mostly black/nodata)
     if np.count_nonzero(gray) / gray.size < 0.1:
         return None
@@ -37,45 +37,49 @@ def extract_features(gray):
     """
     Extract Canny edges, Distance Transform, and Lines.
     """
-    # 1. Canny Edges (blur + high thresholds + erosion to reduce density)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    # 1. Sharpen (unsharp mask) — same as online_matcher.preprocess_frame
+    gaussian = cv2.GaussianBlur(gray, (0, 0), 3.0)
+    sharpened = cv2.addWeighted(gray, 1.5, gaussian, -0.5, 0)
+
+    # 2. Canny Edges
+    blurred = cv2.GaussianBlur(sharpened, (5, 5), 0)
     edges = cv2.Canny(blurred, 80, 200)
-    
-    # 2. Distance Transform
-    # Invert edges for DT (0=edge, 1=background)
-    # dist_transform expects 0 at the feature, non-zero elsewhere
-    # So we invert edges: 255 (edge) -> 0, 0 (bg) -> 255
+
+    # 3. Remove small blobs (area < 30 px) — same as online_matcher
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(edges, connectivity=8)
+    for lbl in range(1, n_labels):
+        if stats[lbl, cv2.CC_STAT_AREA] < 30:
+            edges[labels == lbl] = 0
+
+    # 4. Distance Transform
     dt_input = cv2.bitwise_not(edges)
     dt = cv2.distanceTransform(dt_input, cv2.DIST_L2, 5)
-    
-    # 3. Lines (LSD)
+
+    # 5. Lines (LSD)
     lsd = cv2.createLineSegmentDetector(0)
     lines, _, _, _ = lsd.detect(gray)
-    
-    # Filter short lines? Maybe later.
-    
+
     return edges, dt, lines
 
 def main():
     ensure_dir(OUTPUT_DIR)
-    
+
     print(f"Opening map: {MAP_PATH}")
     with rasterio.open(MAP_PATH) as src:
         width = src.width
         height = src.height
-        
+
         print(f"Map size: {width}x{height}")
-        
+
         # Get CRS and Transform
-        # rasterio.transform is Affine object. Convert to list/tuple for JSON.
-        transform_vals = [src.transform.a, src.transform.b, src.transform.c, 
+        transform_vals = [src.transform.a, src.transform.b, src.transform.c,
                           src.transform.d, src.transform.e, src.transform.f]
-        
+
         crs_wkt = src.crs.to_wkt() if src.crs else None
-        
+
         print(f"Map CRS: {src.crs}")
         print(f"Map Transform: {src.transform}")
-        
+
         metadata = {
             "map_path": MAP_PATH,
             "tile_size": TILE_SIZE,
@@ -84,81 +88,62 @@ def main():
             "transform": transform_vals,
             "tiles": []
         }
-        
+
         # Sliding window
         for y in range(0, height, STRIDE):
             for x in range(0, width, STRIDE):
-                # Check if window is within bounds (or handle partial tiles)
-                # For simplicity, let's process partial tiles by padding or just clipping
-                # But for registration, fixed size is better. Let's clip and if too small, skip or pad.
-                # Actually, reading with Window automatically handles clipping if we request valid bounds.
-                # But we want consistent 2048x2048 for the matcher.
-                
-                # Let's adjust window to be full size if possible, or pad.
-                # If x + TILE_SIZE > width, we can either:
-                # 1. Skip if overlap covers it
-                # 2. Shift back to fit
-                # 3. Pad
-                
-                # Let's simple clip for reading, then pad for processing
                 window = Window(x, y, min(TILE_SIZE, width - x), min(TILE_SIZE, height - y))
-                
+
                 if window.width < TILE_SIZE or window.height < TILE_SIZE:
                     print(f"Skipping partial tile {x},{y}: {window.width}x{window.height}")
                     continue
 
                 img_data = src.read(window=window)
-                
+
                 # Handle shapes
                 if img_data.shape[0] == 1:
-                    # Grayscale
                     img = img_data[0]
                 else:
-                    # RGB or RGBA. Take first 3 bands and assumes RGB
                     img = np.transpose(img_data[:3], (1, 2, 0))
-                    # Convert RGB to BGR for OpenCV
                     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-
-                # No padding needed if we skip partials
 
                 # Preprocess
                 gray = preprocess_tile(img)
                 if gray is None:
                     continue
-                
+
                 # Extract features
                 edges, dt, lines = extract_features(gray)
-                
+
                 # Save
                 tile_id = f"tile_{x}_{y}"
                 tile_dir = os.path.join(OUTPUT_DIR, tile_id)
                 ensure_dir(tile_dir)
-                
+
                 cv2.imwrite(os.path.join(tile_dir, "gray.png"), gray)
                 cv2.imwrite(os.path.join(tile_dir, "edges.png"), edges)
                 np.save(os.path.join(tile_dir, "dt.npy"), dt)
-                # Lines might be None
                 if lines is not None:
                     np.save(os.path.join(tile_dir, "lines.npy"), lines)
                 else:
                     np.save(os.path.join(tile_dir, "lines.npy"), np.array([]))
-                
+
                 # Store metadata
                 metadata["tiles"].append({
                     "id": tile_id,
                     "x": x,
                     "y": y,
-                    "width": window.width, # Original valid width
-                    "height": window.height # Original valid height
+                    "width": window.width,
+                    "height": window.height
                 })
-                
+
                 print(f"Processed {tile_id}")
-        
+
         # Save metadata
         with open(os.path.join(OUTPUT_DIR, "metadata.json"), "w") as f:
             json.dump(metadata, f, indent=2)
-            
-    print("Map processing complete..")
+
+    print("Map processing complete.")
 
 if __name__ == "__main__":
     main()

@@ -104,18 +104,30 @@ SKIP_SECONDS = 35 # Skip takeoff sequence
 
 # --- Uniqueness gate thresholds (ratio-based + absolute) ---
 # --- Uniqueness gate thresholds (ratio-based + absolute) ---
-UNIQUENESS_MEDIAN_RATIO = 1.15   # median2/median1 must be >= this
-UNIQUENESS_MEDIAN_DIFF  = 0.3    # OR median2 - median1 must be >= this
-UNIQUENESS_CORE_DIFF    = 0.03   # core_ratio1 - core_ratio2 must be >= this
-UNIQUENESS_SCORE_RATIO  = 1.05   # score1/score2 must be >= this
+UNIQUENESS_MEDIAN_RATIO = 1.25   # median2/median1 must be >= this (INCREASED to reduce false positives)
+UNIQUENESS_MEDIAN_DIFF  = 0.4    # OR median2 - median1 must be >= this (INCREASED)
+UNIQUENESS_CORE_DIFF    = 0.05   # core_ratio1 - core_ratio2 must be >= this (INCREASED)
+UNIQUENESS_SCORE_RATIO  = 1.10   # score1/score2 must be >= this (INCREASED)
 
 # --- Orientation gate (tightened for GT mode) ---
 ORIENTED_CORE_RATIO_MIN  = 0.10  # min fraction of edges with matching gradient direction
 GRADIENT_ANGLE_THRESH_DEG = 15.0 # max |delta_theta| for oriented inlier
 
 # --- Gray NCC secondary score ---
-GRAY_NCC_WEIGHT   = 0.4          # weight for grayscale NCC in combined score
-EDGE_SCORE_WEIGHT = 0.6          # weight for edge/DT coarse score
+GRAY_NCC_WEIGHT   = 0.6          # weight for grayscale NCC (INCREASED for better texture discrimination)
+EDGE_SCORE_WEIGHT = 0.4          # weight for edge/DT coarse score (DECREASED)
+GRAY_NCC_MIN_GATE = 0.25         # minimum NCC for GT acceptance (texture must actually match!)
+
+# --- Edge density gate (skip featureless frames) ---
+EDGE_DENSITY_MIN  = 0.004        # minimum edge pixel ratio (edge_pixels / total_pixels)
+                                  # frames with fewer edges are too featureless for reliable matching
+
+# --- Contour chain consistency (shoreline matching) ---
+CONTOUR_MIN_ARC       = 150      # minimum contour arc length (px) - INCREASED to filter noise
+CONTOUR_CHAIN_MIN     = 0.40     # minimum chain consistency score for GT acceptance
+CONTOUR_LABEL_THICK   = 3        # label map thickness (THIN - must be precise)
+CONTOUR_TOP_N         = 15       # only use top-N longest contours (discard small fragments)
+CONTOUR_SHAPE_PENALTY = 0.6      # penalize chain if shape doesn't match (matchShapes > this)
 
 # --- Line-only verify ---
 LINE_MIN_LENGTH = 200            # min line segment length (px) – raised for road/canal only
@@ -124,8 +136,8 @@ LINE_TOP_N      = 20             # keep only this many longest lines
 # --- Multi-patch consistency (anchor + local refine) ---
 MULTI_PATCH_ENABLED  = True      # enable 5-patch position consistency check
 MULTI_PATCH_MARGIN   = 0.15      # fraction from each edge for corner patches
-MULTI_PATCH_POS_THR  = 200        # max pos_std across patches (pixels)
-MULTI_PATCH_ANG_THR  = 8.0       # max std(angle) across patches (degrees)
+MULTI_PATCH_POS_THR  = 150        # max pos_std across patches (pixels) - TIGHTENED
+MULTI_PATCH_ANG_THR  = 5.0       # max std(angle) across patches (degrees) - TIGHTENED
 MULTI_PATCH_LOCAL_R  = 256       # search radius around anchor (map pixels)
 MULTI_PATCH_SIZE     = 0.60      # patch size as fraction of frame dimension
 
@@ -138,7 +150,7 @@ EDGE_ACCUM_N        = 5          # number of recent frames to OR together
 
 # --- NEW: Temporal N-frame lock ---
 TEMPORAL_LOCK_N = 3  # tracking lock
-GT_LOCK_N = 8        # GT write lock             # consecutive consistent frames before GT write
+GT_LOCK_N = 2        # GT write lock             # consecutive consistent frames before GT write
 TEMPORAL_MAX_JUMP_M = 30.0       # max jump in metres between consecutive frames
 TEMPORAL_MAX_ANGLE_DIFF = 10.0   # max rotation change between consecutive frames
 
@@ -170,6 +182,7 @@ class DroneLocalizer:
         self.last_tile_idx = -1
         self.last_scale = None
         self.last_pose = None # {x, y, scale, angle} relative to tile
+        self.last_global_pos = None  # (gx, gy) in map pixel coords
         
         # Cache
         self.tile_cache = {}
@@ -273,7 +286,7 @@ class DroneLocalizer:
             lines = np.load(lines_path)
         else:
             lines = None
-        
+
         data = {"inv_dt": inv_dt, "dt": dt, "info": tile_info, "gray": gray, "lines": lines,
                 # Pre-upload to GPU once – reused every frame
                 "inv_dt_gpu": _to_umat(inv_dt),
@@ -373,9 +386,10 @@ class DroneLocalizer:
         return patch_edges, x1, y1
 
 
-    def coarse_search(self, frame_edges, top_k=5, prior_global_px=None, prior_roi_px=1100):
+    def coarse_search(self, frame_edges, top_k=5, prior_global_px=None, prior_roi_px=1100, frame_gray=None):
         """
         Match frame_edges against tiles.  GPU-accelerated via UMat.
+        Uses combined edge/DT + grayscale NCC scoring for farmland robustness.
         Returns Top-K matches list: [{tile_idx, score, ...}, ...]
         """
         # --- ROI GATING (best for clean GT): if prior is available, restrict GLOBAL/LOST search to tiles overlapping ROI ---
@@ -387,11 +401,9 @@ class DroneLocalizer:
                     roi_tile_idxs = None
             except Exception:
                 roi_tile_idxs = None
-        
-        
-        
+
         candidates = []
-        
+
         # Determine search indices
         if self.state == "LOCKED" and self.last_tile_idx != -1:
              current_tile = self.tiles[self.last_tile_idx]
@@ -406,18 +418,24 @@ class DroneLocalizer:
 
         if roi_tile_idxs is not None:
             search_indices = roi_tile_idxs
-            
+
+        use_gray = frame_gray is not None
+
         # Precompute rotated templates (keep on GPU)
         templates = []
         h, w = frame_edges.shape
         frame_gpu = _to_umat(frame_edges)
-        
+        if use_gray:
+            gray_gpu = _to_umat(frame_gray)
+
         for scale in COARSE_SCALES:
             scaled_w, scaled_h = int(w*scale), int(h*scale)
             if scaled_w == 0 or scaled_h == 0: continue
-            
+
             resized_gpu = cv2.resize(frame_gpu, (scaled_w, scaled_h))
-            
+            if use_gray:
+                gray_resized_gpu = cv2.resize(gray_gpu, (scaled_w, scaled_h))
+
             for angle in range(-ROTATION_RANGE, ROTATION_RANGE + 1, ROTATION_STEP):
                  M = cv2.getRotationMatrix2D((scaled_w//2, scaled_h//2), angle, 1.0)
                  rotated_gpu = cv2.warpAffine(resized_gpu, M, (scaled_w, scaled_h),
@@ -426,7 +444,8 @@ class DroneLocalizer:
                                               borderValue=0)
                  # Downsampled template on GPU (0.25x)
                  small_tmpl_gpu = cv2.resize(rotated_gpu, (0, 0), fx=0.25, fy=0.25)
-                 templates.append({
+
+                 tmpl_entry = {
                      "img_gpu": small_tmpl_gpu,
                      "scale": scale,
                      "angle": angle,
@@ -434,41 +453,62 @@ class DroneLocalizer:
                      "w": scaled_w,
                      "sh": _to_numpy(small_tmpl_gpu).shape[0],
                      "sw": _to_numpy(small_tmpl_gpu).shape[1],
-                 })
+                 }
+
+                 if use_gray:
+                     gray_rotated_gpu = cv2.warpAffine(gray_resized_gpu, M, (scaled_w, scaled_h),
+                                                       flags=cv2.INTER_LINEAR,
+                                                       borderMode=cv2.BORDER_CONSTANT,
+                                                       borderValue=0)
+                     tmpl_entry["gray_gpu"] = cv2.resize(gray_rotated_gpu, (0, 0), fx=0.25, fy=0.25)
+
+                 templates.append(tmpl_entry)
 
         # Match against tiles (GPU matchTemplate)
         all_candidates = []
-        
+
         for tile_idx in search_indices:
             tile_data = self.get_tile_data(tile_idx)
             inv_dt_gpu = tile_data["inv_dt_gpu"]
-            
+
             # Downsample tile on GPU
             small_inv_dt_gpu = cv2.resize(inv_dt_gpu, (0,0), fx=0.25, fy=0.25)
             si_h = _to_numpy(small_inv_dt_gpu).shape[0]
             si_w = _to_numpy(small_inv_dt_gpu).shape[1]
-            
+
+            # Downsample tile gray for NCC
+            if use_gray:
+                small_gray_tile_gpu = cv2.resize(_to_umat(tile_data["gray"]), (0,0), fx=0.25, fy=0.25)
+
             for t in templates:
                 if t["sh"] > si_h or t["sw"] > si_w:
                     continue
-                    
-                # GPU matchTemplate
+
+                # Edge/DT matchTemplate
                 res_gpu = cv2.matchTemplate(small_inv_dt_gpu, t["img_gpu"],
                                             cv2.TM_CCOEFF_NORMED)
-                _, max_val, _, max_loc = cv2.minMaxLoc(res_gpu)
-                
+                _, edge_score, _, max_loc = cv2.minMaxLoc(res_gpu)
+
+                # Grayscale NCC at the same location
+                combined_score = edge_score
+                if use_gray and "gray_gpu" in t:
+                    gray_res = cv2.matchTemplate(small_gray_tile_gpu, t["gray_gpu"],
+                                                 cv2.TM_CCOEFF_NORMED)
+                    _, gray_score, _, gray_loc = cv2.minMaxLoc(gray_res)
+                    combined_score = EDGE_SCORE_WEIGHT * edge_score + GRAY_NCC_WEIGHT * gray_score
+
                 # Track best score for debug
                 if not hasattr(self, '_best_score_seen'):
                     self._best_score_seen = 0.0
-                if max_val > self._best_score_seen:
-                    self._best_score_seen = max_val
+                if combined_score > self._best_score_seen:
+                    self._best_score_seen = combined_score
 
-                if max_val > 0.1:
+                if combined_score > 0.1:
                     x = max_loc[0] * 4
                     y = max_loc[1] * 4
                     all_candidates.append({
                         "tile_idx": tile_idx,
-                        "score": max_val,
+                        "score": combined_score,
                         "x": x,
                         "y": y,
                         "scale": t["scale"],
@@ -644,6 +684,128 @@ class DroneLocalizer:
                 return False
 
         return True
+
+    # ------------------------------------------------------------------
+    #  Contour chain matching ("shoreline" shape matching)
+    # ------------------------------------------------------------------
+    def _extract_major_contours(self, edges, min_arc_length=None):
+        """
+        Extract major contours from edge image as polylines.
+        Edges are connected into chains (like shoreline strips), small blobs discarded.
+        """
+        if min_arc_length is None:
+            min_arc_length = CONTOUR_MIN_ARC
+        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        major = []
+        for cnt in contours:
+            arc = cv2.arcLength(cnt, False)
+            if arc >= min_arc_length:
+                epsilon = 0.005 * arc
+                approx = cv2.approxPolyDP(cnt, epsilon, False)
+                major.append(approx)
+        major.sort(key=lambda c: cv2.arcLength(c, False), reverse=True)
+        return major
+
+    def _contour_chain_verify(self, tile_data, frame_edges, match, fh, fw):
+        """
+        Contour chain consistency with SHAPE comparison.
+
+        For each major frame contour:
+        1. Project it to tile space
+        2. Find which tile contour it overlaps with (label map)
+        3. Compare SHAPES using cv2.matchShapes (Hu moments)
+        4. Chain is "consistent" only if it hits one tile contour AND shapes match
+
+        Returns: (chain_score, n_frame_contours)
+        """
+        from collections import Counter
+
+        # 1. Frame contours (only top-N longest)
+        frame_contours = self._extract_major_contours(frame_edges)
+        frame_contours = frame_contours[:CONTOUR_TOP_N]
+        if len(frame_contours) < 2:
+            return 0.0, len(frame_contours)
+
+        # 2. Tile edges from DT (dt < 1.0 = edge pixel)
+        dt = tile_data["dt"]
+        tile_edges = (dt < 1.0).astype(np.uint8) * 255
+        tile_contours = self._extract_major_contours(tile_edges)
+        tile_contours = tile_contours[:CONTOUR_TOP_N]
+        if len(tile_contours) < 2:
+            return 0.0, len(frame_contours)
+
+        # 3. Build THIN tile contour label map
+        label_map = np.zeros(dt.shape, dtype=np.int32)
+        for i, tc in enumerate(tile_contours):
+            cv2.drawContours(label_map, [tc], -1, i + 1,
+                             thickness=CONTOUR_LABEL_THICK)
+
+        # 4. Transform frame contours to tile space
+        scale = float(match["scale"])
+        angle = float(match["angle"])
+        x, y = int(match["x"]), int(match["y"])
+        center = (fw * scale / 2.0, fh * scale / 2.0)
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+
+        total_weighted = 0.0
+        total_weight = 0.0
+
+        for fc in frame_contours:
+            pts = fc.astype(np.float64).reshape(-1, 2)
+            pts = pts * scale
+            pts_t = cv2.transform(pts.reshape(-1, 1, 2), M).reshape(-1, 2)
+            pts_t[:, 0] += x
+            pts_t[:, 1] += y
+
+            # Vectorized label lookup
+            pts_int = np.round(pts_t).astype(np.int32)
+            valid = ((pts_int[:, 0] >= 0) & (pts_int[:, 0] < label_map.shape[1]) &
+                     (pts_int[:, 1] >= 0) & (pts_int[:, 1] < label_map.shape[0]))
+            valid_pts = pts_int[valid]
+            if len(valid_pts) < 3:
+                continue
+
+            labels = label_map[valid_pts[:, 1], valid_pts[:, 0]]
+            labels = labels[labels > 0]
+
+            # --- HIT RATIO: what fraction of points even land on a tile contour? ---
+            hit_ratio = len(labels) / max(len(valid_pts), 1)
+
+            if len(labels) < 3:
+                # Most points don't hit any tile contour → bad alignment
+                weight = cv2.arcLength(fc, False)
+                total_weighted += 0.0  # zero score for this contour
+                total_weight += weight
+                continue
+
+            # Chain consistency: fraction hitting the dominant tile contour
+            counter = Counter(labels.tolist())
+            dominant_label = counter.most_common(1)[0][0]
+            dominant_count = counter.most_common(1)[0][1]
+            chain_consistency = dominant_count / len(labels)
+
+            # --- SHAPE COMPARISON: does this frame contour LOOK like the tile contour? ---
+            shape_score = 1.0  # default: good
+            if dominant_label - 1 < len(tile_contours):
+                matched_tile_contour = tile_contours[dominant_label - 1]
+                # matchShapes returns 0 for identical shapes, higher = more different
+                shape_dist = cv2.matchShapes(fc, matched_tile_contour, cv2.CONTOURS_MATCH_I2, 0)
+                # Penalize if shapes are very different
+                if shape_dist > CONTOUR_SHAPE_PENALTY:
+                    shape_score = max(0.0, 1.0 - (shape_dist - CONTOUR_SHAPE_PENALTY))
+
+            # Combined score for this contour:
+            # chain_consistency * hit_ratio * shape_score
+            contour_score = chain_consistency * hit_ratio * shape_score
+
+            weight = cv2.arcLength(fc, False)
+            total_weighted += contour_score * weight
+            total_weight += weight
+
+        if total_weight < 1.0:
+            return 0.0, len(frame_contours)
+
+        return total_weighted / total_weight, len(frame_contours)
 
     # ------------------------------------------------------------------
     #  Orientation (gradient direction) verification
@@ -1276,7 +1438,18 @@ class DroneLocalizer:
 
             t0 = time.time()
             enhanced, edges, frame_lines, edge_before, edge_after = self.preprocess_frame(frame)
-            
+
+            # --- Edge density gate: skip featureless frames ---
+            fh_check, fw_check = edges.shape[:2]
+            edge_density = edge_after / max(fh_check * fw_check, 1)
+            if edge_density < EDGE_DENSITY_MIN:
+                print(f"[SKIP] Frame {frame_idx}: edge density {edge_density:.4f} < {EDGE_DENSITY_MIN} (featureless)")
+                pending_streak.clear()
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+                continue
+
             # --- Edge accumulation: OR last N frames ---
             self._edge_ring.append(edges.copy())
             if len(self._edge_ring) > EDGE_ACCUM_N:
@@ -1301,7 +1474,9 @@ class DroneLocalizer:
             _nz = cv2.countNonZero(center_edges)
             print(f"[PATCH DEBUG] size={center_edges.shape} nz={_nz} off={off_x},{off_y}")
 
-            candidates_partial = self.coarse_search(center_edges, top_k=5, prior_global_px=self._prior_px, prior_roi_px=self.prior_roi_px)
+            # Extract center gray patch (same crop as edges)
+            center_gray = enhanced[off_y:off_y+center_edges.shape[0], off_x:off_x+center_edges.shape[1]].copy()
+            candidates_partial = self.coarse_search(center_edges, top_k=5, prior_global_px=self._prior_px, prior_roi_px=self.prior_roi_px, frame_gray=center_gray)
             
             # Convert partial-patch coords to full-frame coords
             candidates = []
@@ -1428,7 +1603,7 @@ class DroneLocalizer:
             if candidates:
                 _a = candidates[0]  # already expanded to full-frame w/h
                 anchor_med, _, _, _, _, _, _ = self.verify_match(_a, edges_for_coarse, frame_enhanced=None)
-                if anchor_med is not None and anchor_med > 10.0:
+                if anchor_med is not None and anchor_med > 25.0:
                     bad_anchor = True
                     print(f"[ANCHOR DEBUG] BAD ANCHOR! Score={_a['score']:.3f} Med={anchor_med:.1f}px")
             # Verify Top-K (pass enhanced for Sobel orientation)
@@ -1471,10 +1646,14 @@ class DroneLocalizer:
                 line_med, line_cr = self._compute_line_verify(
                     tile_data_c, long_line_mask, cand, fh, fw)
 
+                # --- Contour chain consistency ("shoreline" matching) ---
+                chain_score, chain_n = self._contour_chain_verify(
+                    tile_data_c, edges, cand, fh, fw)
+
                 # --- Combined score (edge coarse + gray NCC) ---
                 score_final = (EDGE_SCORE_WEIGHT * cand["score"]
                                + GRAY_NCC_WEIGHT * max(0.0, gray_ncc))
-                
+
                 verified_candidates.append({
                     "cand": cand,
                     "quality": score_final,
@@ -1483,6 +1662,8 @@ class DroneLocalizer:
                     "line_med": line_med,
                     "line_cr": line_cr,
                     "score_final": score_final,
+                    "chain_score": chain_score,
+                    "chain_n": chain_n,
                 })
 
             # Sort by DT alignment quality: core_ratio (desc) is the most
@@ -1595,8 +1776,8 @@ class DroneLocalizer:
             reject_reason = []
             if best_match and best_metrics:
                 # --- relaxed gates for keeping a candidate in temporal buffer ---
-                pass_count    = (limit_count >= 500)
-                pass_accuracy = (median_dist <= 15.0)
+                pass_count    = (limit_count >= 15)
+                pass_accuracy = (median_dist <= 20.0)
                 pass_cov      = (grid_coverage >= 0.35)
                 pass_orient   = (oriented_core_ratio >= ORIENTED_CORE_RATIO_MIN)
 
@@ -1636,24 +1817,34 @@ class DroneLocalizer:
                         reject_reason.append("MED")
 
                     # 3) Core ratio must be strong
-                    if core_ratio < 0.40:
+                    if core_ratio < 0.20:
                         gt_ok = False
                         reject_reason.append("CORE")
 
                     # 4) Multipatch spatial std must be tight
-                    if multipatch_pos_std > 120:
+                    if multipatch_pos_std > MULTI_PATCH_POS_THR:
                         gt_ok = False
                         reject_reason.append("MP_STD")
 
-                    # 5) Temporal lock: at least 4 consecutive frames in streak
-                    if len(pending_streak) < 4:
+                    # 5) Temporal lock: at least 2 consecutive frames in streak
+                    if len(pending_streak) < GT_LOCK_N:
                         gt_ok = False
                         reject_reason.append("TEMP")
 
-                    # 6) Tile jump: absolutely forbidden
-                    if self.last_tile_idx not in (-1, best_match["tile_idx"]):
-                        gt_ok = False
-                        reject_reason.append("TILE_JUMP")
+                    # 6) Global position jump: check consistency in map coordinates
+                    # (tile ID can change between overlapping tiles — that's fine
+                    #  as long as the global position is consistent)
+                    if self.last_global_pos is not None:
+                        tile_info = self.tiles[best_match["tile_idx"]]
+                        cur_gx = tile_info["x"] + best_match["x"]
+                        cur_gy = tile_info["y"] + best_match["y"]
+                        dx = cur_gx - self.last_global_pos[0]
+                        dy = cur_gy - self.last_global_pos[1]
+                        pos_jump = (dx**2 + dy**2) ** 0.5
+                        # Max ~200px jump between consecutive GT frames
+                        if pos_jump > 200:
+                            gt_ok = False
+                            reject_reason.append("POS_JUMP")
 
                     # 7) Scale drift: max 10%
                     if self.last_scale is not None:
@@ -1663,12 +1854,12 @@ class DroneLocalizer:
                             reject_reason.append("SCALE_DRIFT")
 
                     # 8) Oriented core ratio
-                    if oriented_core_ratio < 0.15:
+                    if oriented_core_ratio < 0.10:
                         gt_ok = False
                         reject_reason.append("ORI")
 
                     # 9) Grid coverage
-                    if grid_coverage < 0.45:
+                    if grid_coverage < 0.35:
                         gt_ok = False
                         reject_reason.append("COV")
 
@@ -1677,7 +1868,21 @@ class DroneLocalizer:
                         gt_ok = False
                         reject_reason.append("ANCHOR")
 
-                    # 11) Temporal consistency check (spatial jump between frames)
+                    # 11) NCC texture gate: frame & tile must actually look alike
+                    _best_ncc = verified_candidates[0]["gray_ncc"] if verified_candidates else 0.0
+                    if _best_ncc < GRAY_NCC_MIN_GATE:
+                        gt_ok = False
+                        reject_reason.append("NCC_LOW")
+
+                    # 12) Contour chain consistency: frame contour shapes must
+                    #     map onto consistent tile contour shapes
+                    _best_chain = verified_candidates[0].get("chain_score", 0.0) if verified_candidates else 0.0
+                    _best_chain_n = verified_candidates[0].get("chain_n", 0) if verified_candidates else 0
+                    if _best_chain_n >= 2 and _best_chain < CONTOUR_CHAIN_MIN:
+                        gt_ok = False
+                        reject_reason.append("CHAIN")
+
+                    # 13) Temporal consistency check (spatial jump between frames)
                     if gt_ok:
                         if not self.check_temporal_consistency(match_data, pending_streak[:-1], required_n=GT_LOCK_N):
                             gt_ok = False
@@ -1692,6 +1897,15 @@ class DroneLocalizer:
                     # failed relaxed gates -> break the temporal buffer
                     pending_streak.clear()
                     reject_reason.append("RELAXED_GATE")
+
+            # --- DEBUG: Save comparison visualization (every frame with candidates) ---
+            if len(verified_candidates) > 0:
+                self._save_debug_comparison(
+                    frame_idx, edges, verified_candidates,
+                    uniqueness_reason, multipatch_pos_std,
+                    is_valid_gt, reject_reason
+                )
+
             output = frame.copy()
 
             # --- Write ALL frames to all_matches.csv ---
@@ -1771,6 +1985,16 @@ class DroneLocalizer:
                 self.lock_counter = LOCK_WINDOW
                 self.last_tile_idx = best_match["tile_idx"]
                 self.last_scale = best_match["scale"]
+                # Track global position for POS_JUMP check
+                _gt_tile = self.tiles[best_match["tile_idx"]]
+                self.last_global_pos = (
+                    _gt_tile["x"] + best_match["x"],
+                    _gt_tile["y"] + best_match["y"]
+                )
+
+                # --- Visual tracking chain: use last GT as prior for next frame ---
+                # Critical when no GPS/SRT available - narrows search to nearby tiles
+                self._prior_px = self.last_global_pos
                 
                 _sf = verified_candidates[0]['score_final']
                 _gncc = verified_candidates[0]['gray_ncc']
@@ -1856,6 +2080,11 @@ class DroneLocalizer:
             diag_parts.append(f"edg={edge_before}/{edge_after}")
             diag_parts.append(f"strk={len(pending_streak)}")
             diag_parts.append(f"mpstd={multipatch_pos_std:.1f}")
+            # Chain contour score
+            if verified_candidates:
+                _cs = verified_candidates[0].get("chain_score", 0.0)
+                _cn = verified_candidates[0].get("chain_n", 0)
+                diag_parts.append(f"chain={_cs:.2f}({_cn})")
             if is_valid_gt:
                 diag_parts.append("GT_SAVED_ULTRA")
             elif reject_reason:
@@ -1939,6 +2168,139 @@ class DroneLocalizer:
                 matches.append((i, best_idx))
                 
         return matches
+
+    def _save_debug_comparison(self, frame_idx, frame_edges, verified_candidates,
+                               uniqueness_reason, multipatch_std, is_valid_gt, reject_reasons):
+        """
+        Save debug visualization comparing top-2 candidates side-by-side.
+        Helps identify false positives and ambiguous matches.
+        """
+        import os
+        debug_dir = "debug_output"
+        os.makedirs(debug_dir, exist_ok=True)
+
+        if len(verified_candidates) == 0:
+            return
+
+        # Get top-2 candidates
+        best = verified_candidates[0]
+        second = verified_candidates[1] if len(verified_candidates) >= 2 else None
+
+        # Create canvas: [Frame | Tile-1 | Tile-2]
+        h_f, w_f = frame_edges.shape
+        canvas_h = h_f * 2
+        canvas_w = w_f * 3
+        canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+
+        # --- Top-left: Frame edges with contour overlay ---
+        frame_vis = cv2.cvtColor(frame_edges, cv2.COLOR_GRAY2BGR)
+        frame_vis[frame_edges > 0] = [0, 255, 0]  # green edges
+        # Draw major contours as colored polylines (shoreline chains)
+        frame_contours = self._extract_major_contours(frame_edges)
+        contour_colors = [(0, 255, 255), (255, 0, 255), (255, 165, 0),
+                          (0, 165, 255), (255, 255, 0), (128, 255, 128)]
+        for ci, cnt in enumerate(frame_contours[:6]):
+            cv2.drawContours(frame_vis, [cnt], -1, contour_colors[ci % len(contour_colors)], 2)
+        canvas[0:h_f, 0:w_f] = frame_vis
+        cv2.putText(canvas, f"FRAME CONTOURS ({len(frame_contours)})", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        # --- Top-middle: Best candidate tile edges (CYAN) ---
+        tile1_data = self.get_tile_data(best["cand"]["tile_idx"])
+        tile1_gray = tile1_data["gray"]
+
+        # Extract ROI from tile matching the frame
+        x1, y1 = best["cand"]["x"], best["cand"]["y"]
+        w1, h1 = best["cand"]["w"], best["cand"]["h"]
+
+        # Compute edges from tile gray for visualization
+        tile1_edges = cv2.Canny(tile1_gray[y1:y1+h1, x1:x1+w1], 80, 200)
+        tile1_edges_resized = cv2.resize(tile1_edges, (w_f, h_f))
+
+        tile1_vis = cv2.cvtColor(tile1_edges_resized, cv2.COLOR_GRAY2BGR)
+        tile1_vis[tile1_edges_resized > 0] = [255, 255, 0]  # cyan edges
+        canvas[0:h_f, w_f:w_f*2] = tile1_vis
+
+        # Draw tile contours too
+        tile1_contours = self._extract_major_contours(tile1_edges_resized)
+        for ci, cnt in enumerate(tile1_contours[:6]):
+            cv2.drawContours(canvas[0:h_f, w_f:w_f*2], [cnt], -1,
+                             contour_colors[ci % len(contour_colors)], 2)
+
+        # Metrics text for best
+        m1 = best["metrics"]
+        score1 = best["score_final"]
+        _cs1 = best.get("chain_score", 0.0)
+        _cn1 = best.get("chain_n", 0)
+        text1 = [
+            f"BEST (Tile {best['cand']['tile_idx']})",
+            f"Score: {score1:.3f}  NCC: {best.get('gray_ncc', 0):.2f}",
+            f"Median: {m1[0]:.1f}px",
+            f"Core: {m1[5]:.2f}  Orient: {m1[6]:.2f}",
+            f"Cov: {m1[3]:.2f}",
+            f"Chain: {_cs1:.2f} ({_cn1} contours)"
+        ]
+        for i, txt in enumerate(text1):
+            cv2.putText(canvas, txt, (w_f + 10, 30 + i*25),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+        # --- Top-right: Second candidate tile edges (MAGENTA) if exists ---
+        if second is not None:
+            tile2_data = self.get_tile_data(second["cand"]["tile_idx"])
+            tile2_gray = tile2_data["gray"]
+
+            x2, y2 = second["cand"]["x"], second["cand"]["y"]
+            w2, h2 = second["cand"]["w"], second["cand"]["h"]
+
+            tile2_edges = cv2.Canny(tile2_gray[y2:y2+h2, x2:x2+w2], 80, 200)
+            tile2_edges_resized = cv2.resize(tile2_edges, (w_f, h_f))
+
+            tile2_vis = cv2.cvtColor(tile2_edges_resized, cv2.COLOR_GRAY2BGR)
+            tile2_vis[tile2_edges_resized > 0] = [255, 0, 255]  # magenta edges
+            canvas[0:h_f, w_f*2:w_f*3] = tile2_vis
+
+            # Metrics text for second
+            m2 = second["metrics"]
+            score2 = second["score_final"]
+            text2 = [
+                f"2ND (Tile {second['cand']['tile_idx']})",
+                f"Score: {score2:.3f}",
+                f"Median: {m2[0]:.1f}px",
+                f"Core: {m2[5]:.2f}",
+                f"Orient: {m2[6]:.2f}",
+                f"Cov: {m2[3]:.2f}"
+            ]
+            for i, txt in enumerate(text2):
+                cv2.putText(canvas, txt, (w_f*2 + 10, 30 + i*25),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+
+        # --- Bottom: Summary info ---
+        summary_y = h_f + 30
+        uniqueness_color = (0, 255, 0) if uniqueness_reason == "OK" else (0, 0, 255)
+        gt_color = (0, 255, 0) if is_valid_gt else (0, 165, 255)
+
+        _chain_str = f"Chain: {best.get('chain_score', 0):.2f}" if best else "Chain: N/A"
+        summary_lines = [
+            f"Frame {frame_idx}  |  Uniqueness: {uniqueness_reason}  |  {_chain_str}  |  MP STD: {multipatch_std:.1f}px",
+            f"GT: {'YES' if is_valid_gt else 'NO'}  |  Reject: {', '.join(reject_reasons) if reject_reasons else 'N/A'}",
+            f"Candidates: {len(verified_candidates)}  |  NCC: {best.get('gray_ncc', 0):.2f}" if best else f"Candidates: 0"
+        ]
+
+        for i, txt in enumerate(summary_lines):
+            color = gt_color if i == 1 else uniqueness_color if i == 0 else (255, 255, 255)
+            cv2.putText(canvas, txt, (10, summary_y + i*30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+        # Save to file
+        filename = os.path.join(debug_dir, f"frame_{frame_idx:05d}_debug.jpg")
+        cv2.imwrite(filename, canvas)
+
+        # Also save rejected GT frames separately for analysis
+        if not is_valid_gt and len(verified_candidates) > 0:
+            reject_dir = os.path.join(debug_dir, "rejected_gt")
+            os.makedirs(reject_dir, exist_ok=True)
+            reject_file = os.path.join(reject_dir, f"frame_{frame_idx:05d}_REJECT.jpg")
+            cv2.imwrite(reject_file, canvas)
 
     def visualize_match(self, frame_img, frame_lines, match):
         if not match: return
